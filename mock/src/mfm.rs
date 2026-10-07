@@ -260,17 +260,21 @@ fn scan_token(s: &str, from: usize, pred: impl Fn(u8) -> bool) -> Option<usize> 
 mod tests {
     use eframe::egui;
 
-    /// layout() の出力テキストを結合して返す(装飾は捨てて文字列だけ検査)
-    fn layout_text(input: &str) -> String {
+    /// layout() の LayoutJob を取得する(テキストと区間書式を検査)
+    fn layout_job(input: &str) -> egui::text::LayoutJob {
         let ctx = egui::Context::default();
-        let mut out = String::new();
+        let mut job = egui::text::LayoutJob::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let job = super::layout(input, ui);
-                out = job.text.clone();
+                job = super::layout(input, ui);
             });
         });
-        out
+        job
+    }
+
+    /// layout() の出力テキストを結合して返す(装飾は捨てて文字列だけ検査)
+    fn layout_text(input: &str) -> String {
+        layout_job(input).text
     }
 
     // MFM-01: 装飾記法は除去され、本文は残る(F-05-1/6)
@@ -289,12 +293,25 @@ mod tests {
         assert!(out2.contains("#タグ"));
     }
 
-    // MFM-03: 引用行の内側もインライン装飾が適用される(F-05-8)
+    // MFM-03: 引用行の内側もインライン装飾が適用され、行全体が斜体(F-05-8)
     #[test]
     fn mfm03_quote_inline() {
-        let out = layout_text("> **強調**と@aliceの引用行");
-        assert!(out.starts_with("❝ "));
-        assert!(out.contains("強調と@aliceの引用行"), "out: {out}");
-        assert!(!out.contains("**"), "装飾記法が残っている: {out}");
+        let job = layout_job("> **強調**と@aliceの引用行");
+        assert!(job.text.starts_with("❝ "));
+        assert!(
+            job.text.contains("強調と@aliceの引用行"),
+            "out: {}",
+            job.text
+        );
+        assert!(
+            !job.text.contains("**"),
+            "装飾記法が残っている: {}",
+            job.text
+        );
+        // 引用記号と本文の全区間が斜体(メンション等の装飾色は維持する)
+        for sec in &job.sections {
+            let text = &job.text[sec.byte_range.clone()];
+            assert!(sec.format.italics, "斜体になっていない区間がある: {text:?}");
+        }
     }
 }
