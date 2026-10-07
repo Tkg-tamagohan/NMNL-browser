@@ -8,8 +8,10 @@ use eframe::egui::{Color32, FontId, TextFormat, text::LayoutJob};
 /// 本文を LayoutJob に変換する(行内装飾のみ、簡易走査)
 pub fn layout(text: &str, ui: &eframe::egui::Ui) -> LayoutJob {
     let mut job = LayoutJob::default();
-    job.wrap.max_width = f32::INFINITY;
-    job.wrap.max_rows = usize::MAX;
+    // max_width は Label::wrap() が利用可能幅で上書きするため設定しない。
+    // 空白を含まない長いトークン(URL 等)でも列幅を超えて確保矩形が領域を
+    // 拡大するのを防ぐため、任意位置での折り返しを許可する
+    job.wrap.break_anywhere = true;
     let base_size = ui.text_style_height(&eframe::egui::TextStyle::Body);
     let base = FontId::proportional(base_size);
     let fg = ui.visuals().text_color();
