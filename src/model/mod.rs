@@ -138,6 +138,19 @@ pub struct Note {
     pub url: Option<String>,
 }
 
+impl Note {
+    /// 自身のコンテンツ(本文・CW・添付)を持たない純粋なリノートかどうか
+    /// (F-03-4 のリノートフィルタ)。renote_id を持ちながら自身の添付などを
+    /// 持つものは引用であり、ここには含めない
+    pub fn is_pure_renote(&self) -> bool {
+        self.renote_id.is_some()
+            && self.text.is_none()
+            && self.cw.is_none()
+            && self.files.is_empty()
+            && self.file_ids.is_empty()
+    }
+}
+
 /// `POST /api/i/notifications` の通知(F-04)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

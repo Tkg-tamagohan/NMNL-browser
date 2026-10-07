@@ -336,8 +336,9 @@ fn apply_column_filters(notes: Vec<Note>, filters: &ColumnFilters) -> Vec<Note> 
             if !filters.include_replies && n.reply_id.is_some() {
                 return false;
             }
-            // 純粋なリノート(本文なしの転載)のみ落とし、引用は残す
-            if !filters.include_renotes && n.renote_id.is_some() && n.text.is_none() {
+            // 純粋なリノート(本文・CW・添付を持たない転載)のみ落とし、引用は残す。
+            // text が null でも添付を持つものは引用なので残す(io 実測で存在)
+            if !filters.include_renotes && n.is_pure_renote() {
                 return false;
             }
             if filters.files_only
@@ -825,6 +826,16 @@ mod tests {
         );
         assert_eq!(page3.notes.len(), 1);
         assert_eq!(page3.notes[0].id, "outer");
+
+        // 本文 null でも添付を持つノートは引用であり、リノート非表示でも残す
+        let mut quote = fixture_note("q1");
+        quote["renoteId"] = serde_json::json!("target");
+        quote["text"] = serde_json::Value::Null;
+        quote["files"] = serde_json::json!([fixture_file()]);
+        quote["fileIds"] = serde_json::json!(["f1"]);
+        let page4 = TimelinePage::new(vec![serde_json::from_value(quote).unwrap()], &filters);
+        assert_eq!(page4.notes.len(), 1);
+        assert_eq!(page4.notes[0].id, "q1");
     }
 
     // TL-05: Paging 既定値は有効な limit を持つ(0 は INVALID_PARAM になる)
