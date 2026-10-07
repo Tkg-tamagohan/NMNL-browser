@@ -1,9 +1,16 @@
+mod api;
+mod app;
+mod config;
+mod model;
+
 use eframe::egui;
 use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
+    let config = config::AppConfig::load();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([config.window.width, config.window.height]),
         ..Default::default()
     };
     eframe::run_native(
@@ -11,7 +18,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             configure_fonts(&cc.egui_ctx);
-            Ok(Box::new(NmnlApp))
+            Ok(Box::new(app::NmnlApp::new(cc)))
         }),
     )
 }
@@ -39,15 +46,4 @@ fn configure_fonts(ctx: &egui::Context) {
         .or_default()
         .push("noto-sans-jp".to_owned());
     ctx.set_fonts(fonts);
-}
-
-struct NmnlApp;
-
-impl eframe::App for NmnlApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("NMNL-browser");
-            ui.label("misskey.io 専用デッキクライアント");
-        });
-    }
 }
