@@ -1,13 +1,10 @@
-mod api;
-mod app;
-mod config;
-mod model;
-
 use eframe::egui;
+use nmnl_browser::app::NmnlApp;
+use nmnl_browser::config::AppConfig;
 use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
-    let config = config::AppConfig::load();
+    let config = AppConfig::load();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([config.window.width, config.window.height]),
@@ -18,7 +15,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             configure_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::NmnlApp::new(cc)))
+            Ok(Box::new(NmnlApp::new(cc)))
         }),
     )
 }
