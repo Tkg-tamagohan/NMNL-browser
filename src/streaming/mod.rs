@@ -267,9 +267,10 @@ async fn run(
 }
 
 /// 接続中のループ。購読命令の処理と受信フレームのイベント化を行う。
-/// `Connected` は張り直した購読の ack が揃う(または ACK_TIMEOUT 経過)まで
-/// 保留にする。REST 欠落補充が購読有効化より先に走ってノートを取りこぼすのを
-/// 防ぐため(F-03-6)
+/// `Connected` は張り直した購読の ack が揃う(または待ち中の購読が解除で
+/// 空になる)まで保留にし、ACK_TIMEOUT で揃わなければ接続失敗として
+/// 張り直しからやり直す。REST 欠落補充が購読有効化より先に走ってノートを
+/// 取りこぼすのを防ぐため(F-03-6)
 async fn drive(
     read: &mut futures_util::stream::SplitStream<WsStream>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
@@ -302,6 +303,11 @@ async fn drive(
                             let _ = response.send(sub_id);
                             return DriveEnd::Lost;
                         }
+                        // Connected 未発行の間に送った購読も ack 待ちに加える。
+                        // さもないとその購読の有効化前に Connected が出る
+                        if !connected_sent {
+                            pending_acks.insert(sub_id.clone());
+                        }
                         let _ = response.send(sub_id);
                     }
                     Some(StreamCmd::Unsubscribe { sub_id }) => {
@@ -313,6 +319,13 @@ async fn drive(
                             .is_err()
                         {
                             return DriveEnd::Lost;
+                        }
+                        // 解除で待ち中の購読が空になったら待機完了とみなす。
+                        // このままだと ack 期限で健全な接続を切ってしまう
+                        if pending_acks.is_empty() && !connected_sent {
+                            let _ = event_tx
+                                .send(StreamEvent::Connected { is_reconnect });
+                            connected_sent = true;
                         }
                     }
                     Some(StreamCmd::Shutdown) | None => return DriveEnd::Shutdown,
