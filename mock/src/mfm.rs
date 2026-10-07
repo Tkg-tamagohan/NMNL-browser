@@ -31,6 +31,7 @@ pub fn layout(text: &str, ui: &eframe::egui::Ui) -> LayoutJob {
             let mut fmt = TextFormat::simple(base.clone(), Color32::LIGHT_GRAY);
             fmt.italics = true;
             job.append("❝ ", 0.0, fmt);
+            let start = job.sections.len();
             render_inline(
                 content,
                 &mut job,
@@ -40,6 +41,10 @@ pub fn layout(text: &str, ui: &eframe::egui::Ui) -> LayoutJob {
                 code_bg,
                 strong_fg,
             );
+            // 引用行は全体を斜体にする。追加された区間すべてに italics を付ける
+            for sec in &mut job.sections[start..] {
+                sec.format.italics = true;
+            }
         } else {
             render_inline(content, &mut job, &base, fg, accent, code_bg, strong_fg);
         }
