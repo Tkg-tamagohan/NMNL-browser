@@ -1,0 +1,14 @@
+[package]
+name = "nmnl-browser"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "misskey.io 専用の軽量デッキクライアント"
+
+[dependencies]
+eframe = "0.32"
+
+# N-01 の配布物サイズ目標(30MB 以内)に向けた release プロファイル
+[profile.release]
+lto = "thin"
+strip = true

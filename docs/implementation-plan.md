@@ -46,7 +46,7 @@ UI 層は API 層を直接呼ばず、イベント集約層を介する。
 
 各フェーズはおおむね 1 PR とし、進捗は本書のチェックリストで管理する。
 
-- [ ] Phase 1: プロジェクト骨格と CI
+- [x] Phase 1: プロジェクト骨格と CI
   - cargo プロジェクト初期化、eframe の空ウィンドウ、rustfmt と clippy、GitHub Actions(Linux と Windows のビルドと lint)。
   - 受け入れ条件: `cargo build` と `cargo clippy` が CI で通り、空のウィンドウが起動する。
 - [ ] Phase 2: 設定と認証
