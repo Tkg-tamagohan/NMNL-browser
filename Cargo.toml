@@ -7,6 +7,16 @@ description = "misskey.io 専用の軽量デッキクライアント"
 
 [dependencies]
 eframe = "0.32"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+directories = "6"
+keyring = "3"
+uuid = { version = "1", features = ["v4"] }
+open = "5"
+tempfile = "3"
 
 # N-01 の配布物サイズ目標(30MB 以内)に向けた release プロファイル
 [profile.release]
