@@ -268,24 +268,36 @@ async fn run(
 
 /// 接続中のループ。購読命令の処理と受信フレームのイベント化を行う。
 /// `Connected` は張り直した購読の ack が揃う(または待ち中の購読が解除で
-/// 空になる)まで保留にし、ACK_TIMEOUT で揃わなければ接続失敗として
-/// 張り直しからやり直す。REST 欠落補充が購読有効化より先に走ってノートを
-/// 取りこぼすのを防ぐため(F-03-6)
+/// 空になる)まで保留にし、期限切れがあれば接続失敗として張り直しから
+/// やり直す。REST 欠落補充が購読有効化より先に走ってノートを取りこぼすのを
+/// 防ぐため(F-03-6)
 async fn drive(
     read: &mut futures_util::stream::SplitStream<WsStream>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
     subs: &mut HashMap<String, StreamChannel>,
     cmd_rx: &mut mpsc::UnboundedReceiver<StreamCmd>,
     event_tx: &mpsc::UnboundedSender<StreamEvent>,
-    mut pending_acks: std::collections::HashSet<String>,
+    pending_acks: std::collections::HashSet<String>,
     is_reconnect: bool,
 ) -> DriveEnd {
+    // ack 待ちは購読ごとの期限(送信時刻 + ACK_TIMEOUT)で管理する。
+    // 遅れて追加された購読にも十分な待ち時間を与え、他の処理で既存の
+    // 期限が伸びないようにする
+    let mut pending_acks: HashMap<String, tokio::time::Instant> = pending_acks
+        .into_iter()
+        .map(|id| (id, tokio::time::Instant::now() + ACK_TIMEOUT))
+        .collect();
     let mut connected_sent = pending_acks.is_empty();
     if connected_sent {
         let _ = event_tx.send(StreamEvent::Connected { is_reconnect });
     }
-    let ack_deadline = tokio::time::Instant::now() + ACK_TIMEOUT;
     loop {
+        // 次に切れる ack 期限(待ち中が空 = Connected 発行済みなら来ない)
+        let next_deadline = pending_acks
+            .values()
+            .min()
+            .copied()
+            .unwrap_or_else(|| tokio::time::Instant::now() + ACK_TIMEOUT);
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
@@ -306,7 +318,10 @@ async fn drive(
                         // Connected 未発行の間に送った購読も ack 待ちに加える。
                         // さもないとその購読の有効化前に Connected が出る
                         if !connected_sent {
-                            pending_acks.insert(sub_id.clone());
+                            pending_acks.insert(
+                                sub_id.clone(),
+                                tokio::time::Instant::now() + ACK_TIMEOUT,
+                            );
                         }
                         let _ = response.send(sub_id);
                     }
@@ -331,7 +346,7 @@ async fn drive(
                     Some(StreamCmd::Shutdown) | None => return DriveEnd::Shutdown,
                 }
             }
-            _ = tokio::time::sleep_until(ack_deadline), if !connected_sent => {
+            _ = tokio::time::sleep_until(next_deadline), if !connected_sent => {
                 // ack が期限までに揃わなければ購読が有効化される保証がない。
                 // Connected は「欠落補充してよい」契機なので、ここで発行すると
                 // 補充完了〜購読有効化の間のノートを取りこぼす。接続失敗として
@@ -346,7 +361,8 @@ async fn drive(
                     Some(Ok(Message::Text(text))) => {
                         if let Some(ev) = parse_stream_message(&text, subs) {
                             let last_ack = matches!(&ev, StreamEvent::Subscribed { sub_id }
-                                if pending_acks.remove(sub_id) && pending_acks.is_empty());
+                                if pending_acks.remove(sub_id).is_some()
+                                    && pending_acks.is_empty());
                             let _ = event_tx.send(ev);
                             // 最後の ack まで揃った時点で Connected を発行する
                             // (REST 欠落補充は購読有効化の後である必要がある)
