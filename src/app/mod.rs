@@ -13,6 +13,11 @@ use tokio::task::JoinHandle;
 /// 認可待ちポーリングの間隔。miauth/check は認可前 `{"ok":false}` を返すだけなので
 /// ユーザーがブラウザで認可するまで周期的に問い合わせる。
 const MIAUTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// ポーリング中の連続エラーの許容数。超えたら認可待ちを打ち切る。
+const MIAUTH_MAX_FAILURES: u32 = 15;
+/// 認可直後の /api/i 検証の試行数と間隔(トークン伝播の遅延を吸収する)
+const MIAUTH_VERIFY_ATTEMPTS: u32 = 3;
+const MIAUTH_VERIFY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 enum AuthState {
@@ -128,23 +133,59 @@ impl NmnlApp {
         let session = session_id.clone();
         let task = self.runtime.spawn(async move {
             let client = ApiClient::anonymous(config::HOST);
+            let mut failures = 0u32;
             loop {
                 tokio::time::sleep(MIAUTH_POLL_INTERVAL).await;
                 match client.miauth_check(&session).await {
-                    Ok(MiauthStatus::Authorized { token, user }) => {
-                        let _ = tx.send(AppEvent::MiauthResult {
-                            result: Ok((token, user)),
-                        });
+                    Ok(MiauthStatus::Authorized { token, .. }) => {
+                        // 取り込んだトークンを /api/i で検証してから通知する
+                        // (N-02: 無効なトークンを keyring に保存しない)。
+                        let verify = ApiClient::with_token(config::HOST, token.clone());
+                        let mut verified = None;
+                        let mut last_err = None;
+                        for attempt in 0..MIAUTH_VERIFY_ATTEMPTS {
+                            match verify.i().await {
+                                Ok(user) => {
+                                    verified = Some(user);
+                                    break;
+                                }
+                                Err(e) => {
+                                    let fatal = e.is_auth_failure();
+                                    last_err = Some(e);
+                                    if fatal {
+                                        break;
+                                    }
+                                    if attempt + 1 < MIAUTH_VERIFY_ATTEMPTS {
+                                        tokio::time::sleep(MIAUTH_VERIFY_DELAY).await;
+                                    }
+                                }
+                            }
+                        }
+                        let result = match verified {
+                            Some(user) => Ok((token, user)),
+                            None => Err(format!(
+                                "認可されたトークンの検証に失敗しました: {}",
+                                last_err
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_else(|| "不明なエラー".to_owned())
+                            )),
+                        };
+                        let _ = tx.send(AppEvent::MiauthResult { result });
                         ctx.request_repaint();
                         return;
                     }
-                    Ok(MiauthStatus::Pending) => {}
+                    Ok(MiauthStatus::Pending) => failures = 0,
                     Err(e) => {
-                        let _ = tx.send(AppEvent::MiauthResult {
-                            result: Err(e.to_string()),
-                        });
-                        ctx.request_repaint();
-                        return;
+                        failures += 1;
+                        if failures >= MIAUTH_MAX_FAILURES {
+                            let _ = tx.send(AppEvent::MiauthResult {
+                                result: Err(e.to_string()),
+                            });
+                            ctx.request_repaint();
+                            return;
+                        }
+                        // 一時的な障害・レート制限(429)を想定し指数バックオフで継続(N-03)
+                        tokio::time::sleep(MIAUTH_POLL_INTERVAL * 2u32.pow(failures.min(4))).await;
                     }
                 }
             }

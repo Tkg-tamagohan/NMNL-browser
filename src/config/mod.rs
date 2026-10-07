@@ -51,6 +51,7 @@ impl Default for AppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct WindowConfig {
     pub width: f32,
     pub height: f32,
@@ -241,5 +242,22 @@ columns = [{ kind = "timeline" }]
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "this is not toml [[[").unwrap();
         assert_eq!(AppConfig::load_from(&path), AppConfig::default());
+    }
+
+    // CFG-05: [window] の項目が部分的に欠けても既定値で埋まり、他の設定を失わない
+    #[test]
+    fn cfg05_partial_window_keeps_columns() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+columns = [{ kind = "notifications" }]
+
+[window]
+width = 777.0
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.window.width, 777.0);
+        assert_eq!(parsed.window.height, WindowConfig::default().height);
+        assert_eq!(parsed.columns[0].kind, ColumnKind::Notifications);
     }
 }

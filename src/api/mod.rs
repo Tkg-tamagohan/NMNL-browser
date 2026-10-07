@@ -55,10 +55,8 @@ impl ApiError {
 pub enum MiauthStatus {
     /// まだ認可されていない(実測: `{"ok":false}` が返る)
     Pending,
-    Authorized {
-        token: String,
-        user: User,
-    },
+    /// `user` は応答にあることを検証するが、表示名は /api/i の結果で確定するため保持しない。
+    Authorized { token: String },
 }
 
 pub struct ApiClient {
@@ -124,26 +122,34 @@ impl ApiClient {
 
     /// `POST /api/miauth/{session}/check`: 認可の取り込み(F-01-1)
     pub async fn miauth_check(&self, session: &str) -> Result<MiauthStatus, ApiError> {
-        #[derive(serde::Deserialize)]
-        struct Check {
-            ok: bool,
-            #[serde(default)]
-            token: Option<String>,
-            #[serde(default)]
-            user: Option<User>,
-        }
         let endpoint = format!("miauth/{session}/check");
-        let resp: Check = self.post(&endpoint, &serde_json::json!({})).await?;
-        Ok(match (resp.ok, resp.token, resp.user) {
-            (true, Some(token), Some(user)) => MiauthStatus::Authorized { token, user },
-            (true, _, _) => {
-                return Err(ApiError::Unexpected(
-                    "miauth/check が ok:true だが token/user を欠いています".to_owned(),
-                ));
-            }
-            (false, _, _) => MiauthStatus::Pending,
-        })
+        let value: serde_json::Value = self.post(&endpoint, &serde_json::json!({})).await?;
+        parse_miauth_response(value)
     }
+}
+
+/// miauth/check の応答を解釈する。
+/// io 実測: 認可前は `{"ok":false}`、認可後は `{"ok":true,"token":...,"user":{...}}`。
+fn parse_miauth_response(value: serde_json::Value) -> Result<MiauthStatus, ApiError> {
+    #[derive(serde::Deserialize)]
+    struct Check {
+        ok: bool,
+        #[serde(default)]
+        token: Option<String>,
+        #[serde(default)]
+        user: Option<User>,
+    }
+    let resp: Check =
+        serde_json::from_value(value).map_err(|e| ApiError::Unexpected(e.to_string()))?;
+    Ok(match (resp.ok, resp.token, resp.user) {
+        (true, Some(token), Some(_)) => MiauthStatus::Authorized { token },
+        (true, _, _) => {
+            return Err(ApiError::Unexpected(
+                "miauth/check が ok:true だが token/user を欠いています".to_owned(),
+            ));
+        }
+        (false, _, _) => MiauthStatus::Pending,
+    })
 }
 
 /// MiAuth の認可 URL を生成する(F-01-1)
@@ -183,15 +189,23 @@ mod tests {
     // AUTH-02: miauth/check 応答の解釈(ok:false は Pending、ok:true は token+user を要する)
     #[test]
     fn auth02_miauth_check_parse() {
-        let pending: serde_json::Value = serde_json::json!({"ok": false});
-        assert!(!pending["ok"].as_bool().unwrap());
+        match parse_miauth_response(serde_json::json!({"ok": false})).unwrap() {
+            MiauthStatus::Pending => {}
+            _ => panic!("ok:false は Pending のはず"),
+        }
 
         let ok = serde_json::json!({
             "ok": true,
             "token": "tok",
             "user": {"id": "u1", "username": "alice", "name": "Alice", "avatarUrl": null}
         });
-        let user: User = serde_json::from_value(ok["user"].clone()).unwrap();
-        assert_eq!(user.username, "alice");
+        match parse_miauth_response(ok).unwrap() {
+            MiauthStatus::Authorized { token } => assert_eq!(token, "tok"),
+            _ => panic!("ok:true は Authorized のはず"),
+        }
+
+        // ok:true でも token/user を欠く応答はエラーにする
+        let broken = serde_json::json!({"ok": true, "user": null});
+        assert!(parse_miauth_response(broken).is_err());
     }
 }
