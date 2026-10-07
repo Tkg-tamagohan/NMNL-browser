@@ -51,12 +51,16 @@ pub fn note_card(ui: &mut Ui, note: &DummyNote, state: &mut CardState) {
             None => true,
         };
 
-        if body_visible && !note.text.is_empty() {
-            let job = mfm::layout(&note.text, ui);
-            ui.add(egui::Label::new(job).wrap());
+        // CW 折りたたみ時は本文だけでなくメディアと入れ子参照も隠す
+        // (CW はノート内容全体の閲覧注意。F-05-3)
+        if body_visible {
+            if !note.text.is_empty() {
+                let job = mfm::layout(&note.text, ui);
+                ui.add(egui::Label::new(job).wrap());
+            }
+            media_block(ui, note, state);
+            nested_reference(ui, note);
         }
-        media_block(ui, note, state);
-        nested_reference(ui, note);
         reactions(ui, note);
         action_row(ui);
     });

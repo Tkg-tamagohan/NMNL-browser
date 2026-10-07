@@ -134,10 +134,13 @@ impl ColumnDeck {
         self.columns.retain(|c| c.id != id);
     }
 
-    /// F-02-1: ドラッグによる並べ替え。`id` のカラムを位置 `to` へ移す
+    /// F-02-1: ドラッグによる並べ替え。`id` のカラムを区切り位置 `to` へ移す。
+    /// `to` は除去前の配列の区切り番号なので、移動元が `to` より左なら
+    /// 除去ぶんだけ挿入位置が 1 つ前にずれる
     pub fn move_to(&mut self, id: u64, to: usize) {
         if let Some(from) = self.columns.iter().position(|c| c.id == id) {
             let col = self.columns.remove(from);
+            let to = if from < to { to.saturating_sub(1) } else { to };
             let to = to.min(self.columns.len());
             self.columns.insert(to, col);
         }
@@ -318,5 +321,31 @@ mod tests {
         assert!(deck.columns[0].paused);
         deck.set_paused(id, false);
         assert!(!deck.columns[0].paused);
+    }
+
+    // COL-05: 並べ替えの区切り位置補正(F-02-1、Devin Review 指摘の回帰)
+    #[test]
+    fn col05_move_boundary() {
+        let mut deck = ColumnDeck::new();
+        let ids: Vec<u64> = deck.columns.iter().map(|c| c.id).collect();
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        // [A,B,C] で A を区切り 2(B|C 間)へ → [B,A,C]
+        deck.move_to(a, 2);
+        assert_eq!(
+            deck.columns.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![b, a, c]
+        );
+        // [B,A,C] で C を区切り 1(B|A 間)へ → [B,C,A]
+        deck.move_to(c, 1);
+        assert_eq!(
+            deck.columns.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![b, c, a]
+        );
+        // 同一区切りへの移動は変化なし(A の左区切り 2 へ A を移動)
+        deck.move_to(a, 2);
+        assert_eq!(
+            deck.columns.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![b, c, a]
+        );
     }
 }

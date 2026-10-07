@@ -23,6 +23,9 @@ struct MockApp {
     add_kind: ColKind,
     /// 設定ポップアウトを開いているカラム
     settings_open: Option<u64>,
+    /// 幅変更ドラッグ開始時の (カラム ID, 幅)。drag_delta は累積値のため
+    /// 毎フレーム現在値へ足すと二重加算になる
+    resize_base: Option<(u64, f32)>,
 }
 
 impl MockApp {
@@ -39,6 +42,7 @@ impl MockApp {
             card_state: CardState::default(),
             add_kind: ColKind::LocalTimeline,
             settings_open: None,
+            resize_base: None,
         }
     }
 }
@@ -251,11 +255,23 @@ fn column_panel(ui: &mut Ui, app: &mut MockApp, idx: usize, deck_h: f32, ops: &m
     if hover {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
+    if resp.drag_started() {
+        app.resize_base = Some((id, width));
+    }
     if resp.dragged() {
+        // drag_delta はドラッグ開始からの累積変位なので開始時の幅を基準にする
+        let base = app
+            .resize_base
+            .filter(|(base_id, _)| *base_id == id)
+            .map(|(_, w)| w)
+            .unwrap_or(width);
         ops.push(Op::SetWidth(
             id,
-            (width + resp.drag_delta().x).clamp(COL_WIDTH_MIN, COL_WIDTH_MAX),
+            (base + resp.drag_delta().x).clamp(COL_WIDTH_MIN, COL_WIDTH_MAX),
         ));
+    }
+    if resp.drag_stopped() {
+        app.resize_base = None;
     }
 }
 

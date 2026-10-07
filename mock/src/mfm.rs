@@ -27,9 +27,19 @@ pub fn layout(text: &str, ui: &eframe::egui::Ui) -> LayoutJob {
             None => (false, line),
         };
         if is_quote {
+            // 引用記号を先に出し、行内装飾(太字・リンク等)は本文同様に走査する
             let mut fmt = TextFormat::simple(base.clone(), Color32::LIGHT_GRAY);
             fmt.italics = true;
-            job.append(&format!("❝ {content}"), 0.0, fmt);
+            job.append("❝ ", 0.0, fmt);
+            render_inline(
+                content,
+                &mut job,
+                &base,
+                Color32::LIGHT_GRAY,
+                accent,
+                code_bg,
+                strong_fg,
+            );
         } else {
             render_inline(content, &mut job, &base, fg, accent, code_bg, strong_fg);
         }
@@ -239,4 +249,47 @@ fn scan_token(s: &str, from: usize, pred: impl Fn(u8) -> bool) -> Option<usize> 
         len += 1;
     }
     (len > 0).then_some(len)
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui;
+
+    /// layout() の出力テキストを結合して返す(装飾は捨てて文字列だけ検査)
+    fn layout_text(input: &str) -> String {
+        let ctx = egui::Context::default();
+        let mut out = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let job = super::layout(input, ui);
+                out = job.text.clone();
+            });
+        });
+        out
+    }
+
+    // MFM-01: 装飾記法は除去され、本文は残る(F-05-1/6)
+    #[test]
+    fn mfm01_markup_stripped() {
+        let out = layout_text("先に**太字**と`code`と*斜体*と~~取消~~です");
+        assert_eq!(out, "先に太字とcodeと斜体と取消です");
+    }
+
+    // MFM-02: マルチバイト文字を含んでもパニックしない(UTF-8 文字境界の回帰)
+    #[test]
+    fn mfm02_multibyte_safe() {
+        let out = layout_text("日本語の文に**太字**と`コード`と:emoji_name:を混ぜる");
+        assert!(out.contains("日本語の文に太字とコードと:emoji_name:を混ぜる"));
+        let out2 = layout_text("絵文字:reaction:と #タグ と@user@misskey.io");
+        assert!(out2.contains("#タグ"));
+    }
+
+    // MFM-03: 引用行の内側もインライン装飾が適用される(F-05-8)
+    #[test]
+    fn mfm03_quote_inline() {
+        let out = layout_text("> **強調**と@aliceの引用行");
+        assert!(out.starts_with("❝ "));
+        assert!(out.contains("強調と@aliceの引用行"), "out: {out}");
+        assert!(!out.contains("**"), "装飾記法が残っている: {out}");
+    }
 }
