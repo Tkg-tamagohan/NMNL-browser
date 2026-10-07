@@ -153,6 +153,7 @@ fn drop_zone(ui: &mut Ui, deck_h: f32, to: usize, ops: &mut Vec<Op>) {
             );
         },
     );
+
     // ドラッグ中のカラムがここで放たれたら並べ替え要求
     if let Some(dragged) = payload {
         ops.push(Op::MoveTo(*dragged, to));
@@ -214,12 +215,16 @@ fn column_panel(ui: &mut Ui, app: &mut MockApp, idx: usize, deck_h: f32, ops: &m
                             ui.add_space(4.0);
                             let notes = &app.deck.columns[idx].notes;
                             for note in notes {
+                                // 行末尾に余白確保を置かない: 子カードが領域の右端まで
+                                // 使った直後に add_space すると確保矩形が右端を超え、
+                                // egui は Ui の max_rect を確保矩形まで拡大する。
+                                // すると次行がさらに広い利用可能幅を得て自己増殖し、
+                                // 列間の隙間が階段状に広がる(実測 +12px/行)。
                                 ui.horizontal(|ui| {
                                     ui.add_space(4.0);
                                     ui.vertical(|ui| {
                                         card::note_card(ui, note, &mut app.card_state);
                                     });
-                                    ui.add_space(4.0);
                                 });
                                 ui.add_space(6.0);
                             }
