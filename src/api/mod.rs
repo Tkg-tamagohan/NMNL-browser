@@ -5,6 +5,7 @@
 use crate::config::{ColumnFilters, TimelineKind};
 use crate::model::{Channel, Emoji, EmojisResponse, InstanceMeta, Note, Notification, User};
 use serde::Serialize;
+use std::time::Duration;
 
 /// F-01-4 の要求権限。MVP 範囲のエンドポイントと照合した最小構成。
 /// (read:user-groups はリスト/アンテナが MVP 対象外のため含めない)
@@ -62,30 +63,41 @@ pub enum MiauthStatus {
 
 pub struct ApiClient {
     http: reqwest::Client,
-    host: String,
+    /// `https://{host}/api`。テストではモックサーバーの URL を差し込む
+    api_base: String,
     token: Option<String>,
 }
 
 impl ApiClient {
     /// 認証不要の呼び出し用(miauth/check、meta など)
     pub fn anonymous(host: impl Into<String>) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            host: host.into(),
-            token: None,
-        }
+        Self::new(host, None)
     }
 
     pub fn with_token(host: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::new(host, Some(token.into()))
+    }
+
+    fn new(host: impl Into<String>, token: Option<String>) -> Self {
+        let host = host.into();
         Self {
             http: reqwest::Client::new(),
-            host: host.into(),
-            token: Some(token.into()),
+            api_base: format!("https://{host}/api"),
+            token,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(api_base: String, token: Option<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            api_base,
+            token,
         }
     }
 
     fn api_url(&self, endpoint: &str) -> String {
-        format!("https://{}/api/{}", self.host, endpoint)
+        format!("{}/{}", self.api_base, endpoint)
     }
 
     /// 全エンドポイント共通の POST。トークンがあれば Misskey 流儀どおり
@@ -100,13 +112,32 @@ impl ApiClient {
         if let (Some(token), Some(obj)) = (&self.token, body.as_object_mut()) {
             obj.insert("i".to_owned(), serde_json::Value::String(token.clone()));
         }
-        let resp = self
-            .http
-            .post(self.api_url(endpoint))
-            .json(&body)
-            .send()
-            .await
-            .map_err(ApiError::Network)?;
+        // N-03: レート制限(429)は Retry-After または指数バックオフで限定的に再試行する
+        let mut attempts = 0u32;
+        let resp = loop {
+            let resp = self
+                .http
+                .post(self.api_url(endpoint))
+                .json(&body)
+                .send()
+                .await
+                .map_err(ApiError::Network)?;
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts < MAX_429_RETRIES
+            {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let delay = retry_after
+                    .map(Duration::from_secs)
+                    .unwrap_or(RETRY_429_BASE * 2u32.pow(attempts));
+                tokio::time::sleep(delay).await;
+                attempts += 1;
+                continue;
+            }
+            break resp;
+        };
         let status = resp.status();
         let value: serde_json::Value = resp.json().await.map_err(ApiError::Network)?;
         if !status.is_success() {
@@ -135,15 +166,18 @@ impl ApiClient {
     }
 
     /// タイムライン系エンドポイント(F-03-1〜4)。io 実測: ホームは `notes/timeline`
-    /// (`notes/home-timeline` は 404)。local/global は匿名でも読める
+    /// (`notes/home-timeline` は 404)。local/global は匿名でも読める。
+    /// 返信フィルタはサーバー任せにせずクライアント側で最終適用する(LTL では
+    /// withReplies:false が無効な実測)。カーソルはフィルタ前の応答から取る
     pub async fn timeline(
         &self,
         kind: TimelineKind,
         paging: &Paging,
         filters: &ColumnFilters,
-    ) -> Result<Vec<Note>, ApiError> {
+    ) -> Result<TimelinePage, ApiError> {
         let body = timeline_body(paging, filters);
-        self.post(timeline_endpoint(kind), &body).await
+        let notes: Vec<Note> = self.post(timeline_endpoint(kind), &body).await?;
+        Ok(TimelinePage::new(notes, filters))
     }
 
     /// `POST /api/notes/show`: ノート単体(F-05)
@@ -213,16 +247,20 @@ impl ApiClient {
     }
 
     /// `POST /api/channels/timeline`: チャンネルカラムのタイムライン(F-03-7)
+    /// フィルタパラメータのサーバー側対応は未検証のため送らず、クライアント側で適用する
     pub async fn channel_timeline(
         &self,
         channel_id: &str,
         paging: &Paging,
-    ) -> Result<Vec<Note>, ApiError> {
-        self.post(
-            "channels/timeline",
-            &channel_timeline_body(channel_id, paging),
-        )
-        .await
+        filters: &ColumnFilters,
+    ) -> Result<TimelinePage, ApiError> {
+        let notes: Vec<Note> = self
+            .post(
+                "channels/timeline",
+                &channel_timeline_body(channel_id, paging),
+            )
+            .await?;
+        Ok(TimelinePage::new(notes, filters))
     }
 
     /// `POST /api/emojis`: ピッカー用の絵文字一覧(F-07-3)。応答は `{"emojis":[...]}` で包まれる
@@ -244,12 +282,73 @@ impl ApiClient {
 }
 
 /// REST のカーソルページング(F-03-3)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Paging {
+    /// 正の整数が必須(0 は Invalid param)
     pub limit: u32,
     pub until_id: Option<String>,
     /// 欠落補充(F-03-6)用の未来方向カーソル
     pub since_id: Option<String>,
+}
+
+impl Default for Paging {
+    fn default() -> Self {
+        Self {
+            limit: 30,
+            until_id: None,
+            since_id: None,
+        }
+    }
+}
+
+/// タイムライン 1 ページ分の結果。表示用ノートはカラムフィルタ適用済みだが、
+/// ページングのカーソルはフィルタ前の応答から取る(フィルタで全件落ちても
+/// 次ページを辿れるようにするため)
+#[derive(Debug)]
+pub struct TimelinePage {
+    pub notes: Vec<Note>,
+    /// フィルタ前の最古ノート ID(untilId 方向の次カーソル)。生応答が空なら None
+    pub oldest_id: Option<String>,
+    /// フィルタ前の最新ノート ID(sinceId 方向の欠落補充用)
+    pub newest_id: Option<String>,
+}
+
+impl TimelinePage {
+    fn new(raw: Vec<Note>, filters: &ColumnFilters) -> Self {
+        let newest_id = raw.first().map(|n| n.id.clone());
+        let oldest_id = raw.last().map(|n| n.id.clone());
+        Self {
+            notes: apply_column_filters(raw, filters),
+            oldest_id,
+            newest_id,
+        }
+    }
+}
+
+/// F-03-4 のフィルタを受信ノートへ最終適用する。
+/// io 実測で withReplies:false が LTL で無効と判明したため、返信フィルタは
+/// サーバー側の効くエンドポイントでもクライアント側で再度適用する(冪等)。
+/// リノート・ファイルフィルタも同じ規則で適用し、サーバー対応の有無に依らない
+fn apply_column_filters(notes: Vec<Note>, filters: &ColumnFilters) -> Vec<Note> {
+    notes
+        .into_iter()
+        .filter(|n| {
+            if !filters.include_replies && n.reply_id.is_some() {
+                return false;
+            }
+            // 純粋なリノート(本文なしの転載)のみ落とし、引用は残す
+            if !filters.include_renotes && n.renote_id.is_some() && n.text.is_none() {
+                return false;
+            }
+            if filters.files_only
+                && n.files.is_empty()
+                && n.renote.as_ref().is_none_or(|r| r.files.is_empty())
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 /// `users/show` の指定方法
@@ -358,6 +457,10 @@ fn parse_miauth_response(value: serde_json::Value) -> Result<MiauthStatus, ApiEr
         (false, _, _) => MiauthStatus::Pending,
     })
 }
+
+/// 429 応答への最大再試行回数と基準遅延(N-03)
+const MAX_429_RETRIES: u32 = 3;
+const RETRY_429_BASE: Duration = Duration::from_millis(500);
 
 /// MiAuth の認可 URL を生成する(F-01-1)
 pub fn miauth_url(host: &str, session: &str, app_name: &str) -> String {
@@ -653,5 +756,196 @@ mod tests {
         assert_eq!(meta.feature("registration"), Some(false));
         assert_eq!(meta.feature("nonexistent"), None);
         assert_eq!(meta.max_note_text_length, Some(3000));
+    }
+
+    fn fixture_file() -> serde_json::Value {
+        serde_json::json!({
+            "id": "f1", "createdAt": "2026-10-07T11:00:00.000Z", "name": "a.webp",
+            "type": "image/webp", "size": 12345, "isSensitive": true,
+            "blurhash": "LEHV6nWB", "url": "https://example.com/a.webp",
+            "thumbnailUrl": "https://example.com/a.thumb.webp",
+            "properties": {"width": 800, "height": 600}, "comment": null
+        })
+    }
+
+    // TL-04: カラムフィルタのクライアント側最終適用(F-03-4)と、
+    // フィルタ前応答からのカーソル取得
+    #[test]
+    fn tl04_client_filters_and_cursor() {
+        let mut reply = fixture_note("r1");
+        reply["replyId"] = serde_json::json!("r0");
+        let plain = fixture_note("p1");
+        let mut rn = fixture_note("rn1");
+        rn["renoteId"] = serde_json::json!("x1");
+        rn["text"] = serde_json::Value::Null; // 純粋リノート
+        let filters = ColumnFilters {
+            include_renotes: false,
+            include_replies: false,
+            files_only: false,
+        };
+        let page = TimelinePage::new(
+            vec![
+                serde_json::from_value(reply).unwrap(),
+                serde_json::from_value(plain).unwrap(),
+                serde_json::from_value(rn).unwrap(),
+            ],
+            &filters,
+        );
+        assert_eq!(page.notes.len(), 1);
+        assert_eq!(page.notes[0].id, "p1");
+        // カーソルはフィルタ前の応答から取る(先頭・末尾が落ちても残る)
+        assert_eq!(page.newest_id.as_deref(), Some("r1"));
+        assert_eq!(page.oldest_id.as_deref(), Some("rn1"));
+
+        // 全件がフィルタ落ちしてもカーソルは残り次ページへ進める
+        let mut only = fixture_note("only");
+        only["replyId"] = serde_json::json!("r0");
+        let page2 = TimelinePage::new(vec![serde_json::from_value(only).unwrap()], &filters);
+        assert!(page2.notes.is_empty());
+        assert_eq!(page2.oldest_id.as_deref(), Some("only"));
+
+        // files_only は入れ子リノート内のファイルも見る
+        let mut inner = fixture_note("inner");
+        inner["files"] = serde_json::json!([fixture_file()]);
+        let mut outer = fixture_note("outer");
+        outer["renoteId"] = serde_json::json!("inner");
+        outer["text"] = serde_json::Value::Null;
+        outer["renote"] = inner;
+        let files_only = ColumnFilters {
+            include_renotes: true,
+            include_replies: true,
+            files_only: true,
+        };
+        let page3 = TimelinePage::new(
+            vec![
+                serde_json::from_value(outer).unwrap(),
+                serde_json::from_value(fixture_note("nofile")).unwrap(),
+            ],
+            &files_only,
+        );
+        assert_eq!(page3.notes.len(), 1);
+        assert_eq!(page3.notes[0].id, "outer");
+    }
+
+    // TL-05: Paging 既定値は有効な limit を持つ(0 は INVALID_PARAM になる)
+    #[test]
+    fn tl05_paging_default_limit() {
+        let p = Paging::default();
+        assert!(p.limit > 0);
+        assert!(p.until_id.is_none() && p.since_id.is_none());
+        let body = notifications_body(&p, &[], &[]);
+        assert_eq!(body["limit"], serde_json::json!(30));
+    }
+
+    // API-02: トークンの i 注入と匿名送信(post の実経路をモックで検証)
+    #[tokio::test]
+    async fn api02_token_injection() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/i")
+                    .json_body_includes("{\"i\":\"tok-1\"}");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(fixture_user());
+            })
+            .await;
+        let client = ApiClient::for_test(
+            format!("{}/api", server.base_url()),
+            Some("tok-1".to_owned()),
+        );
+        let user = client.i().await.unwrap();
+        assert_eq!(user.username, "alice");
+        m.assert_async().await;
+    }
+
+    // API-03: エラー応答の解釈(401 + error.code)
+    #[tokio::test]
+    async fn api03_error_parsing() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/i");
+                then.status(401)
+                    .header("content-type", "application/json")
+                    .body("{\"error\":{\"code\":\"AUTHENTICATION_FAILED\",\"message\":\"bad\"}}");
+            })
+            .await;
+        let client =
+            ApiClient::for_test(format!("{}/api", server.base_url()), Some("bad".to_owned()));
+        let err = client.i().await.unwrap_err();
+        match &err {
+            ApiError::Server { code, .. } => assert_eq!(code, "AUTHENTICATION_FAILED"),
+            _ => panic!("Server エラーのはず: {err:?}"),
+        }
+        assert!(err.is_auth_failure());
+    }
+
+    // API-04: 429 は Retry-After を優先して限定的に再試行する(N-03)
+    #[tokio::test]
+    async fn api04_429_retry() {
+        use httpmock::prelude::*;
+        use httpmock::{HttpMockRequest, HttpMockResponse};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = MockServer::start_async().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = count.clone();
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/emojis");
+                then.respond_with(move |_req: &HttpMockRequest| {
+                    let n = count2.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        // Retry-After: 0 で即再試行(テストの高速化)
+                        HttpMockResponse::builder()
+                            .status(429)
+                            .header("retry-after", "0")
+                            .body("{}")
+                            .build()
+                    } else {
+                        HttpMockResponse::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body("{\"emojis\":[]}")
+                            .build()
+                    }
+                });
+            })
+            .await;
+        let anon = ApiClient::for_test(format!("{}/api", server.base_url()), None);
+        let list = anon.emojis().await.unwrap();
+        assert!(list.is_empty());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert_eq!(m.calls_async().await, 3);
+    }
+
+    // API-05: 公開エンドポイントの往復(匿名では i を載せない)
+    #[tokio::test]
+    async fn api05_public_endpoint_no_token() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                // 完全一致ボディで i が注入されないことを検証
+                when.method(POST)
+                    .path("/api/emojis")
+                    .json_body(serde_json::json!({}));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(
+                        serde_json::json!({"emojis":[{"name":"e1","url":"https://x/e1.png"}]}),
+                    );
+            })
+            .await;
+        let anon = ApiClient::for_test(format!("{}/api", server.base_url()), None);
+        let list = anon.emojis().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "e1");
+        m.assert_async().await;
     }
 }

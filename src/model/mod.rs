@@ -100,7 +100,8 @@ pub struct Note {
     pub reply_id: Option<String>,
     #[serde(default)]
     pub renote_id: Option<String>,
-    /// 返信先。深さ 1 段まで(F-05-4)。それより深い参照はリンク表示に落とす
+    /// 返信先。サーバー応答の入れ子はそのままデコードして保持する
+    /// (io は最大 1 段を返す実測)。表示の深さ制限(F-05-4)は UI 層の責務
     #[serde(default)]
     pub reply: Option<Box<Note>>,
     /// リノート元。同上

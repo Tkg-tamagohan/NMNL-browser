@@ -18,6 +18,9 @@ uuid = { version = "1", features = ["v4"] }
 open = "5"
 tempfile = "3"
 
+[dev-dependencies]
+httpmock = "0.8"
+
 # N-01 の配布物サイズ目標(30MB 以内)に向けた release プロファイル
 [profile.release]
 lto = "thin"
