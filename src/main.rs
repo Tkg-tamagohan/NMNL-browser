@@ -17,7 +17,8 @@ fn main() -> eframe::Result<()> {
 }
 
 // egui のデフォルトフォントは和文グリフを持たないため、
-// 仕様決定 J(UI 言語は日本語のみ)を満たす Noto Sans JP のサブセットを同梱して登録する
+// 仕様決定 J(UI 言語は日本語のみ)を満たすため Noto Sans CJK JP の言語別サブセット版
+// (notofonts/noto-cjk の SubsetOTF/JP、約 4.4MB、SIL OFL 1.1)を同梱して登録する
 fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
