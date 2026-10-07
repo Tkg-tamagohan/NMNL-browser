@@ -27,6 +27,15 @@ use crate::model::{Note, Notification};
 /// 再接続の指数バックオフ。500ms 起点で最大 30 秒(F-03-6)
 const RECONNECT_BASE: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// ハンドシェイクの停滞対策(F-03-6 の相手故障検出)
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 張り直し送信の停滞対策
+const RESUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// connected ack の待ち上限。越えても catch-up 契機(Connected)は発行する
+const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// この秒数以上持続した接続が切れたときだけバックオフをリセットする。
+/// 即切断を繰り返す相手では失敗カウントを維持して遅延を伸ばす
+const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 /// 購読対象のチャンネル(F-03-5 で 1 本の WS に多重化する単位)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -78,8 +87,11 @@ pub enum StreamEvent {
         channel: StreamChannel,
         note: Box<Note>,
     },
-    /// main チャンネルから届いた通知(F-04-1)
-    Notification { notification: Box<Notification> },
+    /// 購読先から届いた通知(main チャンネル、F-04-1)
+    Notification {
+        sub_id: String,
+        notification: Box<Notification>,
+    },
 }
 
 /// アプリ→マネージャの命令
@@ -134,9 +146,10 @@ impl StreamManager {
     /// `wss://{host}/streaming` へ接続するマネージャを起動する
     pub fn spawn(host: &str, token: Option<&str>) -> StreamHandle {
         let mut url = format!("wss://{host}/streaming");
-        // MiAuth トークンは ?i= に載せる(io/本家共通)。トークンは英数字のみの想定
+        // MiAuth トークンは ?i= に載せる(io/本家共通)。英数字のみの想定だが、
+        // URL 構文を壊す文字が混じっても安全なようにエンコードする
         if let Some(token) = token {
-            url.push_str(&format!("?i={token}"));
+            url.push_str(&format!("?i={}", urlencoding::encode(token)));
         }
         Self::spawn_with_url(url)
     }
@@ -169,39 +182,70 @@ async fn run(
     let mut ever_connected = false;
 
     loop {
-        match connect_async(&ws_url).await {
-            Ok((ws, _resp)) => {
-                let (mut write, mut read) = ws.split();
-                // 既存購読を張り直す。送信に失敗したらこの接続は諦めて
-                // 切断処理(backoff → 再接続)へ進む
-                let mut resubscribed = true;
-                for (sub_id, channel) in &subs {
-                    if write
-                        .send(Message::Text(connect_frame(sub_id, channel).into()))
-                        .await
-                        .is_err()
-                    {
-                        resubscribed = false;
-                        break;
-                    }
-                }
-                if resubscribed {
-                    let _ = event_tx.send(StreamEvent::Connected {
-                        is_reconnect: ever_connected,
-                    });
-                    ever_connected = true;
-                    attempt = 0;
-                    match drive(&mut read, &mut write, &mut subs, &mut cmd_rx, &event_tx).await {
-                        DriveEnd::Shutdown => return,
-                        DriveEnd::Lost => {}
-                    }
+        // ハンドシェイクが停滞しても命令を処理できるよう、接続中も cmd_rx を見る。
+        // タイムアウト付きなので応答しない相手でも再試行ループへ進む
+        let outcome = {
+            let mut connect = std::pin::pin!(connect_async(&ws_url));
+            loop {
+                tokio::select! {
+                    res = connect.as_mut() => break Some(res),
+                    _ = sleep(CONNECT_TIMEOUT) => break None,
+                    cmd = cmd_rx.recv() => match cmd {
+                        Some(StreamCmd::Shutdown) | None => return,
+                        Some(cmd) => apply_cmd_offline(cmd, &mut subs),
+                    },
                 }
             }
-            Err(_) => {
-                // 接続自体の失敗も切断として扱い、バックオフして再試行する
+        };
+
+        // 接続が始まった時刻。STABLE_CONNECTION 以上持続した接続だけが
+        // バックオフをリセットする(即切断を繰り返す相手では伸ばし続ける)
+        let mut conn_since: Option<tokio::time::Instant> = None;
+        if let Some(Ok((ws, _resp))) = outcome {
+            let (mut write, mut read) = ws.split();
+            // 既存購読の張り直しにもタイムアウトを設ける
+            let resubscribed = matches!(
+                tokio::time::timeout(RESUBSCRIBE_TIMEOUT, async {
+                    for (sub_id, channel) in &subs {
+                        write
+                            .send(Message::Text(connect_frame(sub_id, channel).into()))
+                            .await
+                            .map_err(|_| ())?;
+                    }
+                    Ok::<(), ()>(())
+                })
+                .await,
+                Ok(Ok(()))
+            );
+            if resubscribed {
+                conn_since = Some(tokio::time::Instant::now());
+                // Connected は購読 ack が揃ってから drive 内で発行する。
+                // 張り直した購読が有効になる前に REST の欠落補充が走り、
+                // その間のノートを取りこぼすのを防ぐため(F-03-6)
+                let pending_acks: std::collections::HashSet<String> =
+                    subs.keys().cloned().collect();
+                let is_reconnect = ever_connected;
+                ever_connected = true;
+                match drive(
+                    &mut read,
+                    &mut write,
+                    &mut subs,
+                    &mut cmd_rx,
+                    &event_tx,
+                    pending_acks,
+                    is_reconnect,
+                )
+                .await
+                {
+                    DriveEnd::Shutdown => return,
+                    DriveEnd::Lost => {}
+                }
             }
         }
 
+        if conn_since.is_some_and(|t| t.elapsed() >= STABLE_CONNECTION) {
+            attempt = 0;
+        }
         let retry_in = backoff_delay(attempt);
         attempt = attempt.saturating_add(1);
         let _ = event_tx.send(StreamEvent::Disconnected { attempt, retry_in });
@@ -219,34 +263,47 @@ async fn run(
     }
 }
 
-/// 接続中のループ。購読命令の処理と受信フレームのイベント化を行う
+/// 接続中のループ。購読命令の処理と受信フレームのイベント化を行う。
+/// `Connected` は張り直した購読の ack が揃う(または ACK_TIMEOUT 経過)まで
+/// 保留にする。REST 欠落補充が購読有効化より先に走ってノートを取りこぼすのを
+/// 防ぐため(F-03-6)
 async fn drive(
     read: &mut futures_util::stream::SplitStream<WsStream>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
     subs: &mut HashMap<String, StreamChannel>,
     cmd_rx: &mut mpsc::UnboundedReceiver<StreamCmd>,
     event_tx: &mpsc::UnboundedSender<StreamEvent>,
+    mut pending_acks: std::collections::HashSet<String>,
+    is_reconnect: bool,
 ) -> DriveEnd {
+    let mut connected_sent = pending_acks.is_empty();
+    if connected_sent {
+        let _ = event_tx.send(StreamEvent::Connected { is_reconnect });
+    }
+    let ack_deadline = tokio::time::Instant::now() + ACK_TIMEOUT;
     loop {
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(StreamCmd::Subscribe { channel, response }) => {
+                        // 送信成否に関わらず購読を保持する。送信失敗時は接続を
+                        // 切り替えるが、保持した分は再接続で張り直される
                         let sub_id = uuid::Uuid::new_v4().to_string();
+                        subs.insert(sub_id.clone(), channel.clone());
                         if write
                             .send(Message::Text(connect_frame(&sub_id, &channel).into()))
                             .await
                             .is_err()
                         {
-                            let _ = response.send(String::new());
+                            let _ = response.send(sub_id);
                             return DriveEnd::Lost;
                         }
-                        subs.insert(sub_id.clone(), channel);
                         let _ = response.send(sub_id);
                     }
                     Some(StreamCmd::Unsubscribe { sub_id }) => {
                         subs.remove(&sub_id);
+                        pending_acks.remove(&sub_id);
                         if write
                             .send(Message::Text(disconnect_frame(&sub_id).into()))
                             .await
@@ -258,6 +315,11 @@ async fn drive(
                     Some(StreamCmd::Shutdown) | None => return DriveEnd::Shutdown,
                 }
             }
+            _ = tokio::time::sleep_until(ack_deadline), if !connected_sent => {
+                // ack が揃わなくても待ち続けず catch-up 契機を発行する
+                let _ = event_tx.send(StreamEvent::Connected { is_reconnect });
+                connected_sent = true;
+            }
             frame = read.next() => {
                 match frame {
                     None | Some(Ok(Message::Close(_))) | Some(Err(_)) => {
@@ -265,6 +327,14 @@ async fn drive(
                     }
                     Some(Ok(Message::Text(text))) => {
                         if let Some(ev) = parse_stream_message(&text, subs) {
+                            if let StreamEvent::Subscribed { sub_id } = &ev {
+                                pending_acks.remove(sub_id);
+                                if pending_acks.is_empty() && !connected_sent {
+                                    let _ = event_tx
+                                        .send(StreamEvent::Connected { is_reconnect });
+                                    connected_sent = true;
+                                }
+                            }
                             let _ = event_tx.send(ev);
                         }
                     }
@@ -344,9 +414,12 @@ fn parse_stream_message(text: &str, subs: &HashMap<String, StreamChannel>) -> Op
                     })
                 }
                 "notification" => {
+                    // 購読済み ID のイベントだけを通す(解除済み購読の滞在メッセージを捨てる)
+                    subs.get(sub_id)?;
                     serde_json::from_value::<Notification>(payload)
                         .ok()
                         .map(|notification| StreamEvent::Notification {
+                            sub_id: sub_id.to_owned(),
                             notification: Box::new(notification),
                         })
                 }
