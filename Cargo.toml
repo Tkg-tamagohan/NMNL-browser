@@ -17,6 +17,12 @@ keyring = { version = "3", features = ["windows-native", "linux-native-sync-pers
 uuid = { version = "1", features = ["v4"] }
 open = "5"
 tempfile = "3"
+futures-util = "0.3"
+# connect_async(クライアント)+ accept_async(テスト用サーバー)と rustls TLS。
+# reqwest と同じく webpki-roots 系で統一する
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# WS URL のトークンを ?i= に載せるときのパーセントエンコード用(MIT)
+urlencoding = "2"
 
 [dev-dependencies]
 httpmock = "0.8"
