@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -8,8 +9,35 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "NMNL-browser",
         options,
-        Box::new(|_cc| Ok(Box::new(NmnlApp))),
+        Box::new(|cc| {
+            configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(NmnlApp))
+        }),
     )
+}
+
+// egui のデフォルトフォントは和文グリフを持たないため、
+// 仕様決定 J(UI 言語は日本語のみ)を満たす Noto Sans JP のサブセットを同梱して登録する
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "noto-sans-jp".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoSansJP-Regular.otf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "noto-sans-jp".to_owned());
+    // 等幅はデフォルトの欧文フォントを優先し、和文のみフォールバック先にする
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("noto-sans-jp".to_owned());
+    ctx.set_fonts(fonts);
 }
 
 struct NmnlApp;
