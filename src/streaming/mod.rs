@@ -31,7 +31,8 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 張り直し送信の停滞対策
 const RESUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// connected ack の待ち上限。越えても catch-up 契機(Connected)は発行する
+/// connected ack の待ち上限。越えたらその接続は失敗として張り直しからやり直す
+/// (Connected を発行してしまうと REST 欠落補充との間に取りこぼしが生じる)
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// この秒数以上持続した接続が切れたときだけバックオフをリセットする。
 /// 即切断を繰り返す相手では失敗カウントを維持して遅延を伸ばす
@@ -183,13 +184,15 @@ async fn run(
 
     loop {
         // ハンドシェイクが停滞しても命令を処理できるよう、接続中も cmd_rx を見る。
-        // タイムアウト付きなので応答しない相手でも再試行ループへ進む
+        // 期限は接続試行の開始時点で固定する(命令の処理でタイムアウトが
+        // リセットされず、応答しない相手でも再試行ループへ進める)
         let outcome = {
+            let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
             let mut connect = std::pin::pin!(connect_async(&ws_url));
             loop {
                 tokio::select! {
                     res = connect.as_mut() => break Some(res),
-                    _ = sleep(CONNECT_TIMEOUT) => break None,
+                    _ = tokio::time::sleep_until(deadline) => break None,
                     cmd = cmd_rx.recv() => match cmd {
                         Some(StreamCmd::Shutdown) | None => return,
                         Some(cmd) => apply_cmd_offline(cmd, &mut subs),
@@ -316,9 +319,11 @@ async fn drive(
                 }
             }
             _ = tokio::time::sleep_until(ack_deadline), if !connected_sent => {
-                // ack が揃わなくても待ち続けず catch-up 契機を発行する
-                let _ = event_tx.send(StreamEvent::Connected { is_reconnect });
-                connected_sent = true;
+                // ack が期限までに揃わなければ購読が有効化される保証がない。
+                // Connected は「欠落補充してよい」契機なので、ここで発行すると
+                // 補充完了〜購読有効化の間のノートを取りこぼす。接続失敗として
+                // 張り直しからやり直す(F-03-6)
+                return DriveEnd::Lost;
             }
             frame = read.next() => {
                 match frame {
@@ -327,15 +332,16 @@ async fn drive(
                     }
                     Some(Ok(Message::Text(text))) => {
                         if let Some(ev) = parse_stream_message(&text, subs) {
-                            if let StreamEvent::Subscribed { sub_id } = &ev {
-                                pending_acks.remove(sub_id);
-                                if pending_acks.is_empty() && !connected_sent {
-                                    let _ = event_tx
-                                        .send(StreamEvent::Connected { is_reconnect });
-                                    connected_sent = true;
-                                }
-                            }
+                            let last_ack = matches!(&ev, StreamEvent::Subscribed { sub_id }
+                                if pending_acks.remove(sub_id) && pending_acks.is_empty());
                             let _ = event_tx.send(ev);
+                            // 最後の ack まで揃った時点で Connected を発行する
+                            // (REST 欠落補充は購読有効化の後である必要がある)
+                            if last_ack && !connected_sent {
+                                let _ = event_tx
+                                    .send(StreamEvent::Connected { is_reconnect });
+                                connected_sent = true;
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
@@ -677,6 +683,162 @@ mod tests {
             }
         }
         assert!(saw_disconnect && saw_reconnect);
+        assert!(conns.load(Ordering::SeqCst) >= 2);
+        handle.shutdown();
+    }
+
+    // STR-06: 再接続時の Connected は張り直し購読の ack 揃い待ち(F-03-6)
+    #[tokio::test]
+    async fn str06_reconnect_connected_waits_for_acks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let conns2 = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(ws) = accept_async(stream).await else {
+                    continue;
+                };
+                let n = conns2.fetch_add(1, Ordering::SeqCst) + 1;
+                let (mut write, mut read) = ws.split();
+                if n == 1 {
+                    // 最初の接続: 2 件の購読を受け取ったら無応答で切断
+                    let _a = read_connect(&mut read).await;
+                    let _b = read_connect(&mut read).await;
+                    drop(write);
+                    drop(read);
+                    continue;
+                }
+                // 再接続: 1 件目の ack → ack 未着の購読先の note → 2 件目の ack
+                let a = read_connect(&mut read).await;
+                let b = read_connect(&mut read).await;
+                write
+                    .send(Message::Text(
+                        serde_json::json!({"type":"connected","body":{"id":a}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                // ack 未着の購読先から届くノートは待機中でも流す(取りこぼしではない)
+                write
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type":"channel",
+                            "body":{"id":b,"type":"note","body":fixture_note("n-early")}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                write
+                    .send(Message::Text(
+                        serde_json::json!({"type":"connected","body":{"id":b}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                while read.next().await.is_some() {}
+            }
+        });
+        let mut handle = StreamManager::spawn_with_url(format!("ws://{addr}/streaming"));
+        handle
+            .subscribe(StreamChannel::Timeline(TimelineKind::Local))
+            .await
+            .unwrap();
+        handle
+            .subscribe(StreamChannel::Timeline(TimelineKind::Global))
+            .await
+            .unwrap();
+
+        let mut subscribed = std::collections::HashSet::new();
+        let mut saw_note = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, handle.event_rx().recv())
+                .await
+                .expect("タイムアウト")
+                .expect("イベントチャンネルが閉じた");
+            match ev {
+                StreamEvent::Subscribed { sub_id } => {
+                    subscribed.insert(sub_id);
+                }
+                StreamEvent::Note { note, .. } => {
+                    assert_eq!(note.id, "n-early");
+                    saw_note = true;
+                }
+                StreamEvent::Connected { is_reconnect: true } => {
+                    // Connected は両購読の ack が揃った後でなければならない
+                    assert_eq!(subscribed.len(), 2);
+                    assert!(saw_note);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        handle.shutdown();
+    }
+
+    // STR-07: ack が ACK_TIMEOUT 内に揃わない接続は失敗として再接続する(F-03-6)
+    #[tokio::test]
+    async fn str07_ack_timeout_reconnects() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let conns2 = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(ws) = accept_async(stream).await else {
+                    continue;
+                };
+                let n = conns2.fetch_add(1, Ordering::SeqCst) + 1;
+                let (write, mut read) = ws.split();
+                // 購読は受け取るが ack は一切返さない相手
+                let _ = read_connect(&mut read).await;
+                if n == 1 {
+                    // 最初の接続は切断して張り直し(ack 待ち)を起こす
+                    drop(write);
+                    drop(read);
+                    continue;
+                }
+                // 2 接続目以降: 接続は保ったまま無応答 → クライアントは
+                // ACK_TIMEOUT でこの接続を失敗とみなして張り直すはず
+                while read.next().await.is_some() {}
+            }
+        });
+        let mut handle = StreamManager::spawn_with_url(format!("ws://{addr}/streaming"));
+        handle
+            .subscribe(StreamChannel::Timeline(TimelineKind::Local))
+            .await
+            .unwrap();
+
+        // 張り直した購読の ack が返らない相手では、クライアントは ACK_TIMEOUT
+        // (5s)で接続を失敗とみなして張り直しを繰り返す。その間 Connected
+        // (is_reconnect) は一度も発行されないはず(発行すると REST 欠落補充
+        // との取りこぼしになる)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut disconnects = 0;
+        while disconnects < 2 {
+            let ev = tokio::time::timeout_at(deadline, handle.event_rx().recv())
+                .await
+                .expect("タイムアウト")
+                .expect("イベントチャンネルが閉じた");
+            match ev {
+                StreamEvent::Disconnected { .. } => disconnects += 1,
+                StreamEvent::Connected { is_reconnect: true } => {
+                    panic!("ack 未着なのに Connected(is_reconnect) が発行された")
+                }
+                _ => {}
+            }
+        }
         assert!(conns.load(Ordering::SeqCst) >= 2);
         handle.shutdown();
     }
