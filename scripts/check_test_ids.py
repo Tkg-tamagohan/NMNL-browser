@@ -4,7 +4,8 @@
 帳簿は docs/implementation-plan.md の「## テスト ID 帳簿」節の表から、
 テストケース列の `PREFIX-NN:` 形式を抽出する。
 コードは src/**/*.rs と mock/**/*.rs の行コメント(//、///、//!)中の
-`[A-Z]{2,5}-\\d{2}` トークンを抽出する(コロン直後一致は要求しない)。
+`[A-Z]{2,5}-\\d{2,3}` トークンを抽出する(コロン直後一致は要求しない)。
+文字列・raw 文字列・文字リテラル中の `//` はコメント開始とみなさない。
 
 分類:
 - コードのみ出現 -> error(帳簿未登録)
@@ -28,10 +29,12 @@ LEDGER_PATH = ROOT / "docs" / "implementation-plan.md"
 LEDGER_HEADING = "## テスト ID 帳簿"
 SCAN_DIRS = ("src", "mock")
 
-# 接頭辞 2〜5 文字の制約で要件 ID(F-01、N-01 系)や UTF-8 等の非 ID を除く。
-# \b で XPOST-01 のような部分一致や POST-066 のような 3 桁を除外する。
-ID_TOKEN_RE = re.compile(r"\b[A-Z]{2,5}-\d{2}\b")
-LEDGER_ID_RE = re.compile(r"\b([A-Z]{2,5}-\d{2})\s*:")
+# 接頭辞 2〜5 文字・番号 2〜3 桁の制約で要件 ID(F-01、N-01 系)、UTF-8、
+# ISO-8601 等の非 ID を除く。前後は単語文字とハイフンを排除し、
+# FOO-BAR-01 の末尾や XPOST-01 の部分一致を除く。
+ID_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9-])[A-Z]{2,5}-\d{2,3}(?![0-9-])")
+LEDGER_ID_RE = re.compile(r"(?<![A-Za-z0-9-])([A-Z]{2,5}-\d{2,3})(?![0-9-])\s*:")
+CHAR_LIT_RE = re.compile(r"'(?:\\.|[^'\\])'")
 NO_TEST_MARKERS = ("単体テストなし", "実機検証")
 
 
@@ -69,12 +72,37 @@ def parse_ledger(path: Path) -> dict[str, str]:
 
 
 def comment_part(line: str) -> str:
-    """行のコメント部分を返す。`://`(URL スキーム)の // はコメントとみなさない。"""
-    idx = line.find("//")
-    while idx != -1:
-        if idx == 0 or line[idx - 1] != ":":
-            return line[idx:]
-        idx = line.find("//", idx + 2)
+    """行の行コメント部分を返す。
+    文字列・raw 文字列・文字リテラル中の `//` と、URL スキーム `://` の
+    `//` はコメント開始とみなさない。
+    複数行にまたがる raw 文字列は対象外(このコードベースでは使われていない)。
+    """
+    in_str = False
+    i = 0
+    n = len(line)
+    while i < n - 1:
+        c = line[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        if c == "'":
+            m = CHAR_LIT_RE.match(line, i)
+            if m:
+                i = m.end()
+                continue
+        if c == "/" and line[i + 1] == "/":
+            if i == 0 or line[i - 1] != ":":
+                return line[i:]
+        i += 1
     return ""
 
 
@@ -98,12 +126,16 @@ def rel(files: set[Path]) -> str:
 
 
 def next_free(ids: list[str]) -> dict[str, str]:
-    """接頭辞ごとの最大連番+1 を次の空き番号として返す。"""
+    """接頭辞ごとの最大連番+1 を次の空き番号として返す。
+    抽出形式の桁上限(3 桁)を超える候補は出せない旨を明示する。"""
     by_prefix: dict[str, int] = {}
     for tid in ids:
         prefix, num = tid.rsplit("-", 1)
         by_prefix[prefix] = max(by_prefix.get(prefix, 0), int(num))
-    return {p: f"{p}-{v + 1:02d}" for p, v in sorted(by_prefix.items())}
+    out = {}
+    for p, v in sorted(by_prefix.items()):
+        out[p] = f"{p}-{v + 1:02d}" if v < 999 else f"{p}-(番号の桁上限 999 に到達)"
+    return out
 
 
 def main() -> int:
