@@ -545,40 +545,55 @@ fn image_cell(
     ctx: &mut UiCtx<'_>,
 ) {
     let opened = ctx.card_state.media_open.contains(&file.id);
-    if file.is_sensitive && !opened {
-        let resp = ui.add(
-            egui::Button::new(
-                RichText::new(format!("⚠ 閲覧注意: {}", file.name))
-                    .size(11.0)
-                    .color(Color32::from_rgb(0xf0, 0xa0, 0x80)),
-            )
-            .wrap(),
-        );
-        ctx.card_state.click_exclusions.push(resp.rect);
-        if resp.clicked() {
-            ctx.card_state.media_open.insert(file.id.clone());
-        }
-        return;
-    }
-    let Some(src) = inline_src(file) else {
-        return;
+    // セル幅は描画内容に関係なく確保する: 縦長画像や閲覧注意ボタンが
+    // 細いままだと horizontal の次のセルが寄ってグリッドが崩れるため
+    let est_h = if file.is_sensitive && !opened {
+        20.0
+    } else {
+        fit_display_size(file, cell_w, max_h)
+            .map(|s| s.y)
+            .unwrap_or(max_h)
     };
-    let img = match fit_display_size(file, cell_w, max_h) {
-        Some(size) => egui::Image::new(src).fit_to_exact_size(size),
-        // 原寸不明はロード後のテクスチャの大きさに任せる(縮小のみ)
-        None => egui::Image::new(src).max_size(vec2(cell_w, max_h)),
-    }
-    .corner_radius(4.0);
-    // クリックで拡大ビューア(F-08-1)
-    let resp = ui.add(img).interact(Sense::click());
-    ctx.card_state.click_exclusions.push(resp.rect);
-    if resp.clicked() {
-        ctx.ops.push(UiOp::OpenViewer {
-            files: images.to_vec(),
-            index,
-            revealed: ctx.card_state.media_open.clone(),
-        });
-    }
+    ui.allocate_ui_with_layout(
+        vec2(cell_w, est_h),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            if file.is_sensitive && !opened {
+                let resp = ui.add(
+                    egui::Button::new(
+                        RichText::new(format!("⚠ 閲覧注意: {}", file.name))
+                            .size(11.0)
+                            .color(Color32::from_rgb(0xf0, 0xa0, 0x80)),
+                    )
+                    .wrap(),
+                );
+                ctx.card_state.click_exclusions.push(resp.rect);
+                if resp.clicked() {
+                    ctx.card_state.media_open.insert(file.id.clone());
+                }
+                return;
+            }
+            let Some(src) = inline_src(file) else {
+                return;
+            };
+            let img = match fit_display_size(file, cell_w, max_h) {
+                Some(size) => egui::Image::new(src).fit_to_exact_size(size),
+                // 原寸不明はロード後のテクスチャの大きさに任せる(縮小のみ)
+                None => egui::Image::new(src).max_size(vec2(cell_w, max_h)),
+            }
+            .corner_radius(4.0);
+            // クリックで拡大ビューア(F-08-1)
+            let resp = ui.add(img).interact(Sense::click());
+            ctx.card_state.click_exclusions.push(resp.rect);
+            if resp.clicked() {
+                ctx.ops.push(UiOp::OpenViewer {
+                    files: images.to_vec(),
+                    index,
+                    revealed: ctx.card_state.media_open.clone(),
+                });
+            }
+        },
+    );
 }
 
 /// ネスト参照の簡易カード(F-05-4 の 1 段表示)。本文は先頭だけ折り返し付き
@@ -646,9 +661,13 @@ fn nested_ref(ui: &mut Ui, note: &Note, icon: &str, ctx: &mut UiCtx<'_>) {
 /// ウィジェットは配置前に幅が決まるため折り返しが正しく効く
 fn reaction_badge(ui: &mut Ui, name: &str, count: u32, note: &Note, ctx: &mut UiCtx<'_>) {
     let key = parse_reaction_key(name);
-    // 自分のリアクション: バッジキーとの一致のほか、リモート絵文字への
+    // 自分のリアクション: バッジキーとの一致(ローカルは `:name:`/
+    // `:name@.:` の形式違いを同名扱い)のほか、リモート絵文字への
     // 相乗り(ローカル :name@.: を送信済み)も自分のものとして扱う
-    let mut mine = note.my_reaction.as_deref() == Some(name);
+    let mut mine = note
+        .my_reaction
+        .as_deref()
+        .is_some_and(|m| reaction_keys_match(m, name));
     if let ReactionKey::Remote(n, _) = key {
         mine |= note
             .my_reaction
@@ -741,21 +760,34 @@ fn reaction_emoji_url(note: &Note, key: &str, ctx: &mut UiCtx<'_>) -> Option<Str
     })
 }
 
+/// リアクションキーの同名判定(F-07-4)。ローカル絵文字は `:name:` と
+/// `:name@.:` の形式違いを同一として扱う(my_reaction とバッジキーの比較用)
+fn reaction_keys_match(a: &str, b: &str) -> bool {
+    match (parse_reaction_key(a), parse_reaction_key(b)) {
+        (ReactionKey::Local(x), ReactionKey::Local(y)) => x == y,
+        (ReactionKey::Remote(x, h1), ReactionKey::Remote(y, h2)) => x == y && h1 == h2,
+        (ReactionKey::Unicode, ReactionKey::Unicode) => a == b,
+        _ => false,
+    }
+}
+
 /// リモート絵文字バッジの相乗り可否(REA-07・仕様決定 O)。
 /// 同名のローカル絵文字(ピッカー一覧掲載)があれば `:name@.:` でトグルできる
 fn remote_badge_toggleable(name: &str, emoji_list: &[crate::model::Emoji]) -> bool {
     emoji_list.iter().any(|e| e.name == name)
 }
 
-/// カードに出すチャンネル(F-05-7)。純粋リノートはリノート元のものを使う
+/// カードに出すチャンネル(F-05-7・仕様決定 P)。純粋リノートは表示対象が
+/// リノート元なのでそちらのチャンネルを優先し、無いときだけ wrapper の
+/// チャンネルにフォールバックする
 fn display_channel(note: &Note) -> Option<&NoteChannel> {
-    note.channel.as_ref().or_else(|| {
-        if note.is_pure_renote() {
-            note.renote.as_ref()?.channel.as_ref()
-        } else {
-            None
-        }
-    })
+    if note.is_pure_renote() {
+        note.renote
+            .as_ref()
+            .and_then(|r| r.channel.as_ref().or(note.channel.as_ref()))
+    } else {
+        note.channel.as_ref()
+    }
 }
 
 /// 仕様決定 R: 当該チャンネルの channel カラム内ではチャンネル名行を省略する
@@ -918,8 +950,15 @@ mod tests {
         assert!(channel_row_hidden(Some("ch1"), "ch1"));
         assert!(!channel_row_hidden(Some("ch1"), "ch2"));
         assert!(!channel_row_hidden(None, "ch1"));
-        // 純粋リノートはリノート元のチャンネルを使う
+        // 純粋リノートはリノート元のチャンネルを使う(wrapper と異なる
+        // チャンネルでも表示対象であるリノート元を優先)
         let mut n = note();
+        n.channel = Some(crate::model::NoteChannel {
+            id: "chA".to_owned(),
+            name: Some("A".to_owned()),
+            color: None,
+            is_sensitive: false,
+        });
         let mut inner = note();
         inner.channel = Some(crate::model::NoteChannel {
             id: "ch9".to_owned(),
@@ -930,6 +969,17 @@ mod tests {
         n.renote_id = Some("t1".to_owned());
         n.renote = Some(Box::new(inner));
         assert_eq!(display_channel(&n).map(|c| c.id.as_str()), Some("ch9"));
+        // リノート元に channel が無いときだけ wrapper にフォールバック
+        let mut n2 = note();
+        n2.channel = Some(crate::model::NoteChannel {
+            id: "chA".to_owned(),
+            name: Some("A".to_owned()),
+            color: None,
+            is_sensitive: false,
+        });
+        n2.renote_id = Some("t2".to_owned());
+        n2.renote = Some(Box::new(note()));
+        assert_eq!(display_channel(&n2).map(|c| c.id.as_str()), Some("chA"));
     }
 
     // IMG-01: 枚数グリッド(仕様決定 L)。1=全幅+上限、2=横 2 分割、
@@ -1062,5 +1112,18 @@ mod tests {
         let list = vec![emoji("blob")];
         assert!(remote_badge_toggleable("blob", &list));
         assert!(!remote_badge_toggleable("nyan", &list));
+    }
+
+    // REA-04(追加面): ローカル絵文字キーの `:name:`/`:name@.:` 形式違いを
+    // 同名扱いする(my_reaction とバッジキーの比較、バッジ分裂の防止)
+    #[test]
+    fn rea04_reaction_keys_match() {
+        assert!(reaction_keys_match(":cat:", ":cat@.:"));
+        assert!(reaction_keys_match(":cat@.:", ":cat:"));
+        assert!(!reaction_keys_match(":cat:", ":dog:"));
+        assert!(reaction_keys_match(":cat@x.tld:", ":cat@x.tld:"));
+        assert!(!reaction_keys_match(":cat:", ":cat@x.tld:"));
+        assert!(reaction_keys_match("❤", "❤"));
+        assert!(!reaction_keys_match("❤", ":heart:"));
     }
 }

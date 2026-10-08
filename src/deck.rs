@@ -9,9 +9,9 @@
 
 use crate::api;
 use crate::config::{ColumnFilters, ColumnKind, ColumnSpec, TimelineKind};
-use crate::model::{Channel, Note, Notification};
+use crate::model::{Channel, Note, Notification, ReactionKey, parse_reaction_key};
 use crate::streaming::StreamChannel;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// カラム幅の許容範囲(px)。F-02-1 の幅変更でクランプする
 pub const COL_WIDTH_MIN: f32 = 180.0;
@@ -575,14 +575,19 @@ impl Column {
     pub fn apply_reaction(&mut self, note_id: &str, reaction: &str, add: bool) {
         fn touch(n: &mut Note, note_id: &str, reaction: &str, add: bool) -> bool {
             if n.id == note_id {
+                // ローカル絵文字は `:name:` と `:name@.:` の両形式で来り
+                // 得るため、同名の既存エントリがあればそちらを動かして
+                // バッジの分裂を防ぐ
+                let key = reaction_existing_key(&n.reactions, reaction)
+                    .unwrap_or_else(|| reaction.to_owned());
                 if add {
-                    *n.reactions.entry(reaction.to_owned()).or_insert(0) += 1;
+                    *n.reactions.entry(key).or_insert(0) += 1;
                     n.my_reaction = Some(reaction.to_owned());
                 } else {
-                    if let Some(c) = n.reactions.get_mut(reaction) {
+                    if let Some(c) = n.reactions.get_mut(&key) {
                         *c = c.saturating_sub(1);
                         if *c == 0 {
-                            n.reactions.remove(reaction);
+                            n.reactions.remove(&key);
                         }
                     }
                     n.my_reaction = None;
@@ -613,6 +618,23 @@ impl Column {
             }
         }
     }
+}
+
+/// リアクションマップ内の実キーを探す(F-07-4)。
+/// ローカル絵文字は `:name:` と `:name@.:` の両形式で来り得るため、
+/// 同名の既存エントリがあればそちらのキーを返してバッジを統合する
+fn reaction_existing_key(reactions: &HashMap<String, u32>, key: &str) -> Option<String> {
+    if reactions.contains_key(key) {
+        return Some(key.to_owned());
+    }
+    if let ReactionKey::Local(name) = parse_reaction_key(key) {
+        for alt in [format!(":{name}@.:"), format!(":{name}:")] {
+            if reactions.contains_key(&alt) {
+                return Some(alt);
+            }
+        }
+    }
+    None
 }
 
 pub fn timeline_label(kind: TimelineKind) -> &'static str {
@@ -804,6 +826,11 @@ impl ColumnDeck {
             c.spec.channel_id.as_deref() != Some(channel_id) || c.items.is_empty()
         });
         self.set_channel(id, Some(channel_id.to_owned()));
+        // 遷移先はタイムライン: 同じチャンネルでも会話ビューのまま残さない
+        // (チャンネル変更時は invalidate が同じことをしている)
+        if let Some(col) = self.columns.iter_mut().find(|c| c.id == id) {
+            col.view = ColumnView::default();
+        }
         (id, need_fetch)
     }
 
@@ -1371,6 +1398,50 @@ mod tests {
         let (id3, need3) = deck.open_channel_column("ch2");
         assert_eq!(id3, id2);
         assert!(!need3);
+        // 会話ビューを開いたまま同じチャンネル名を押しても TL へ戻る
+        deck.columns[idx].view = ColumnView::Conversation {
+            root_id: "a1".to_owned(),
+            notes: vec![],
+            loading: false,
+            error: None,
+        };
+        let (_, need4) = deck.open_channel_column("ch2");
+        assert!(matches!(deck.columns[idx].view, ColumnView::Timeline));
+        assert!(!need4);
+    }
+
+    // REA-04(追加面): ローカル絵文字の `:name:`/`:name@.:` 形式違いを
+    // 同名の既存エントリへ統合し、バッジが分裂しないようにする
+    #[test]
+    fn rea04_reaction_alias_merge() {
+        let mut col = Column::new(
+            1,
+            ColumnSpec {
+                kind: ColumnKind::Timeline,
+                ..Default::default()
+            },
+        );
+        let mut n = note("a1");
+        // サーバーが `:name:` 形式で返してきた既存リアクション
+        n.reactions.insert(":cat:".to_owned(), 2);
+        col.push_note(n);
+        // `:cat@.:` を送った結果も既存エントリに統合される
+        col.apply_reaction("a1", ":cat@.:", true);
+        let ColumnItems::Notes(notes) = &col.items else {
+            panic!()
+        };
+        let n2 = &notes[0];
+        assert_eq!(n2.reactions.len(), 1);
+        assert_eq!(n2.reactions.get(":cat:"), Some(&3));
+        assert_eq!(n2.my_reaction.as_deref(), Some(":cat@.:"));
+        // 取消も同じエントリを減らす
+        col.apply_reaction("a1", ":cat@.:", false);
+        let ColumnItems::Notes(notes) = &col.items else {
+            panic!()
+        };
+        let n3 = &notes[0];
+        assert_eq!(n3.reactions.get(":cat:"), Some(&2));
+        assert_eq!(n3.my_reaction, None);
     }
 
     fn col_index(deck: &ColumnDeck, id: u64) -> usize {
