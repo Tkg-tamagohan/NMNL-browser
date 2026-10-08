@@ -573,18 +573,19 @@ fn image_cell(
     // セル幅は描画内容に関係なく確保する: 縦長画像や閲覧注意ボタンが
     // 細いままだと horizontal の次のセルが寄ってグリッドが崩れるため。
     // 高さは原寸不明でも全高を取らず、ロード済みなら実表示サイズ・
-    // 未ロードは控えめな仮高さに留める(小さいサムネイルで大きな空白が残るため)
-    let est_h = cell_estimate_h(
-        file,
-        opened,
-        cell_w,
-        max_h,
+    // 未ロードは控えめな仮高さに留める(小さいサムネイルで大きな空白が残るため)。
+    // 閲覧注意を展開していないセルではロード呼び出し自体を走らせない
+    // (閲覧注意ボタンの表示だけで画像の取得が始まってしまう)
+    let loaded_size = if !file.is_sensitive || opened {
         inline_src(file).and_then(|s| {
             egui::Image::new(s)
                 .max_size(vec2(cell_w, max_h))
                 .load_and_calc_size(ui, vec2(cell_w, max_h))
-        }),
-    );
+        })
+    } else {
+        None
+    };
+    let est_h = cell_estimate_h(file, opened, cell_w, max_h, loaded_size);
     ui.allocate_ui_with_layout(
         vec2(cell_w, est_h),
         egui::Layout::top_down(egui::Align::Center),
