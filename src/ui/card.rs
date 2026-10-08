@@ -533,6 +533,31 @@ fn fit_display_size(file: &DriveFile, cell_w: f32, max_h: f32) -> Option<egui::V
     Some(vec2(ow * scale, oh * scale))
 }
 
+/// 画像セルに確保する高さ(IMG-02)。閲覧注意の折りたたみや描画ソースなしは
+/// 最小限、原寸既知はフィット後の高さ、原寸不明はロード済みなら実表示
+/// サイズ・未ロードは控えめな仮高さ。全高を取らないのは小さい
+/// サムネイルで大きな空白が残るため
+fn cell_estimate_h(
+    file: &DriveFile,
+    opened: bool,
+    cell_w: f32,
+    max_h: f32,
+    loaded_size: Option<egui::Vec2>,
+) -> f32 {
+    if file.is_sensitive && !opened {
+        return 20.0;
+    }
+    if inline_src(file).is_none() {
+        return 20.0;
+    }
+    if let Some(s) = fit_display_size(file, cell_w, max_h) {
+        return s.y;
+    }
+    loaded_size
+        .map(|s| s.y.min(max_h))
+        .unwrap_or_else(|| 120.0_f32.min(max_h))
+}
+
 /// 画像セル(F-08-1/-2)。センシティブはクリックで展開(F-08-4)、
 /// 通常はアプリ内ビューア(F-08-1)を開く
 fn image_cell(
@@ -546,14 +571,20 @@ fn image_cell(
 ) {
     let opened = ctx.card_state.media_open.contains(&file.id);
     // セル幅は描画内容に関係なく確保する: 縦長画像や閲覧注意ボタンが
-    // 細いままだと horizontal の次のセルが寄ってグリッドが崩れるため
-    let est_h = if file.is_sensitive && !opened {
-        20.0
-    } else {
-        fit_display_size(file, cell_w, max_h)
-            .map(|s| s.y)
-            .unwrap_or(max_h)
-    };
+    // 細いままだと horizontal の次のセルが寄ってグリッドが崩れるため。
+    // 高さは原寸不明でも全高を取らず、ロード済みなら実表示サイズ・
+    // 未ロードは控えめな仮高さに留める(小さいサムネイルで大きな空白が残るため)
+    let est_h = cell_estimate_h(
+        file,
+        opened,
+        cell_w,
+        max_h,
+        inline_src(file).and_then(|s| {
+            egui::Image::new(s)
+                .max_size(vec2(cell_w, max_h))
+                .load_and_calc_size(ui, vec2(cell_w, max_h))
+        }),
+    );
     ui.allocate_ui_with_layout(
         vec2(cell_w, est_h),
         egui::Layout::top_down(egui::Align::Center),
@@ -778,13 +809,14 @@ fn remote_badge_toggleable(name: &str, emoji_list: &[crate::model::Emoji]) -> bo
 }
 
 /// カードに出すチャンネル(F-05-7・仕様決定 P)。純粋リノートは表示対象が
-/// リノート元なのでそちらのチャンネルを優先し、無いときだけ wrapper の
-/// チャンネルにフォールバックする
+/// リノート元なのでそちらのチャンネルを優先し、リノート元が未取得または
+/// チャンネルなしのときだけ wrapper のチャンネルにフォールバックする
 fn display_channel(note: &Note) -> Option<&NoteChannel> {
     if note.is_pure_renote() {
         note.renote
             .as_ref()
-            .and_then(|r| r.channel.as_ref().or(note.channel.as_ref()))
+            .and_then(|r| r.channel.as_ref())
+            .or(note.channel.as_ref())
     } else {
         note.channel.as_ref()
     }
@@ -980,6 +1012,17 @@ mod tests {
         n2.renote_id = Some("t2".to_owned());
         n2.renote = Some(Box::new(note()));
         assert_eq!(display_channel(&n2).map(|c| c.id.as_str()), Some("chA"));
+        // リノート元が未取得(renote_id だけで renote なし)でも
+        // wrapper のチャンネルは消えない
+        let mut n3 = note();
+        n3.channel = Some(crate::model::NoteChannel {
+            id: "chA".to_owned(),
+            name: Some("A".to_owned()),
+            color: None,
+            is_sensitive: false,
+        });
+        n3.renote_id = Some("t3".to_owned());
+        assert_eq!(display_channel(&n3).map(|c| c.id.as_str()), Some("chA"));
     }
 
     // IMG-01: 枚数グリッド(仕様決定 L)。1=全幅+上限、2=横 2 分割、
@@ -999,6 +1042,45 @@ mod tests {
         let cells = grid_cells(5, w);
         assert_eq!(cells.len(), 5);
         assert!(cells.iter().all(|&(cw2, h)| cw2 == cw && h == half));
+    }
+
+    // IMG-04: セルに確保する高さ(IMG-02)。原寸不明で全高を取ると
+    // 小さいサムネイルで大きな空白が残るため、ロード済みは実表示
+    // サイズ・未ロードは控えめな仮高さに留める
+    #[test]
+    fn img04_cell_estimate_h() {
+        // 閲覧注意の折りたたみは最小限
+        let mut f = file("image/webp");
+        f.is_sensitive = true;
+        f.url = Some("https://x/f.webp".to_owned());
+        assert_eq!(cell_estimate_h(&f, false, 150.0, 360.0, None), 20.0);
+        // 閲覧注意を展開済みなら通常どおり見積もる
+        f.properties = Some(crate::model::FileProperties {
+            width: Some(300),
+            height: Some(300),
+        });
+        assert_eq!(cell_estimate_h(&f, true, 150.0, 360.0, None), 150.0);
+        // URL もサムネイルも無ければ高さを取らない
+        let f2 = file("image/webp");
+        assert_eq!(cell_estimate_h(&f2, false, 150.0, 360.0, None), 20.0);
+        // 原寸不明でもロード済みなら実表示サイズで留める
+        let mut f3 = file("image/webp");
+        f3.thumbnail_url = Some("https://x/t.webp".to_owned());
+        assert_eq!(
+            cell_estimate_h(&f3, false, 150.0, 360.0, Some(vec2(150.0, 40.0))),
+            40.0
+        );
+        // 未ロードの原寸不明は控えめな仮高さ(全高ではない)
+        assert_eq!(cell_estimate_h(&f3, false, 150.0, 360.0, None), 120.0);
+        // 原寸既知はフィット後の高さ
+        let mut f4 = file("image/webp");
+        f4.url = Some("https://x/f.webp".to_owned());
+        f4.properties = Some(crate::model::FileProperties {
+            width: Some(100),
+            height: Some(800),
+        });
+        // 150x1200 → 高さ上限 360 に収まるので幅 45 x 360
+        assert_eq!(cell_estimate_h(&f4, false, 150.0, 360.0, None), 360.0);
     }
 
     // IMG-02: セルいっぱいまでの拡大と高さ上限(仕様決定 M、
