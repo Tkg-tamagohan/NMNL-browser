@@ -102,6 +102,8 @@ enum AppEvent {
         kind: FetchKind,
         /// 発行時点のカラム世代。invalidate 前の飛行結果を破棄する照合に使う
         fetch_gen: u64,
+        /// 補充が上限で打ち切られた場合の続き位置(untilId)。None=完走
+        backfill_tail: Option<String>,
         result: Result<FetchResult, String>,
     },
     /// 会話ビュー(F-05-5): 選択ノート自身 + 会話チェーン
@@ -432,14 +434,16 @@ impl NmnlApp {
                 // 切断時点で保存した最新 ID を起点にする。
                 // 復帰直後の新着が先に届いて newest_id が進んでも、
                 // 切断中の区間を取り逃さないように切り離した起点を使う
-                let Some(since) = col.backfill_since.take().or_else(|| col.newest_id.clone())
+                // take せず保持する: 完走(またはエラー後の再接続)まで
+                // 起点を失わない。途中打ち切り時は backfill_until から続く
+                let Some(since) = col.backfill_since.clone().or_else(|| col.newest_id.clone())
                 else {
                     // 未取得なら初回取得に倒す
                     return self.spawn_fetch(col_id, FetchKind::Initial, ctx);
                 };
                 Paging {
                     limit: BACKFILL_LIMIT,
-                    until_id: None,
+                    until_id: col.backfill_until.clone(),
                     since_id: Some(since),
                 }
             }
@@ -451,15 +455,22 @@ impl NmnlApp {
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.runtime.spawn(async move {
-            let result = if kind == FetchKind::Backfill {
-                fetch_backfill_impl(&client, &spec, paging, &ntf_excludes).await
+            let (result, backfill_tail) = if kind == FetchKind::Backfill {
+                match fetch_backfill_impl(&client, &spec, paging, &ntf_excludes).await {
+                    Ok((r, tail)) => (Ok(r), tail),
+                    Err(e) => (Err(e), None),
+                }
             } else {
-                fetch_page_impl(&client, &spec, &paging, &ntf_excludes).await
+                (
+                    fetch_page_impl(&client, &spec, &paging, &ntf_excludes).await,
+                    None,
+                )
             };
             let _ = tx.send(AppEvent::FetchResult {
                 col_id,
                 kind,
                 fetch_gen,
+                backfill_tail,
                 result,
             });
             ctx2.request_repaint();
@@ -562,10 +573,12 @@ impl NmnlApp {
                     retry_in.as_secs_f32()
                 );
                 // 欠落補充の起点を切断時点の最新 ID で固定する。
-                // 復帰後に新着が先に届いて newest_id が進んでも、
-                // 切断中の区間の sinceId はこちらを使う
+                // 未補充の起点が残っているときは上書きしない
+                // (再接続中の途中受信で起点を失わないため)
                 for col in &mut self.deck.columns {
-                    col.backfill_since = col.newest_id.clone();
+                    if col.backfill_since.is_none() {
+                        col.backfill_since = col.newest_id.clone();
+                    }
                 }
             }
             StreamEvent::Subscribed { .. } => {
@@ -631,7 +644,18 @@ impl NmnlApp {
             }
             UiOp::MoveTo(id, to) => self.deck.move_to(id, to),
             UiOp::SetWidth(id, w) => self.deck.set_width(id, w),
-            UiOp::SetPaused(id, p) => self.deck.set_paused(id, p),
+            UiOp::SetPaused(id, p) => {
+                self.deck.set_paused(id, p);
+                // 保留溢れで立った補充起点があれば解除直後に取りに行く
+                if self
+                    .deck
+                    .columns
+                    .iter()
+                    .any(|c| c.id == id && c.backfill_since.is_some())
+                {
+                    self.spawn_fetch(id, FetchKind::Backfill, ctx);
+                }
+            }
             UiOp::SetTimelineKind(id, k) => {
                 self.deck.set_timeline_kind(id, k);
                 self.sync_subscriptions(ctx);
@@ -784,6 +808,7 @@ impl NmnlApp {
                 col_id,
                 kind,
                 fetch_gen,
+                backfill_tail,
                 result,
             } => {
                 let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
@@ -803,6 +828,7 @@ impl NmnlApp {
                     Err(_) => false,
                 };
                 let backfill = matches!(kind, FetchKind::Backfill);
+                let result_ok = result.is_ok();
                 match result {
                     Ok(FetchResult::Page(page)) => {
                         if backfill {
@@ -837,6 +863,26 @@ impl NmnlApp {
                 col.fetching = false;
                 if raw_empty && !backfill {
                     col.exhausted = true;
+                }
+                // 補充が上限で打ち切られた場合は途中位置から続きを取る。
+                // 完走したら起点を消す。エラー時は起点を残して次の再接続でやり直す
+                let respawn = if backfill && result_ok {
+                    match &backfill_tail {
+                        Some(tail) => {
+                            col.backfill_until = Some(tail.clone());
+                            true
+                        }
+                        None => {
+                            col.backfill_since = None;
+                            col.backfill_until = None;
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if respawn {
+                    self.spawn_fetch(col_id, FetchKind::Backfill, ctx);
                 }
             }
             AppEvent::ConversationResult {
@@ -973,13 +1019,16 @@ async fn fetch_backfill_impl(
     spec: &ColumnSpec,
     paging: Paging,
     ntf_excludes: &[String],
-) -> Result<FetchResult, String> {
+) -> Result<(FetchResult, Option<String>), String> {
     let Some(since) = paging.since_id.clone() else {
-        return fetch_page_impl(client, spec, &paging, ntf_excludes).await;
+        return fetch_page_impl(client, spec, &paging, ntf_excludes)
+            .await
+            .map(|r| (r, None));
     };
     let mut cur = Paging {
         since_id: Some(since.clone()),
-        until_id: None,
+        // 途中打ち切りの続き位置(backfill_until)から再開する
+        until_id: paging.until_id,
         limit: paging.limit,
     };
     let mut notes: Vec<Note> = Vec::new();
@@ -1033,7 +1082,7 @@ async fn fetch_backfill_impl(
         }
         cur.until_id = page_oldest;
     }
-    Ok(match spec.kind {
+    let merged = match spec.kind {
         ColumnKind::Notifications => FetchResult::Notifications(notifs),
         ColumnKind::Mentions => FetchResult::Mentions(notes),
         _ => FetchResult::Page(TimelinePage {
@@ -1041,7 +1090,9 @@ async fn fetch_backfill_impl(
             oldest_id: merged_oldest,
             newest_id: merged_newest,
         }),
-    })
+    };
+    // 上限ページ数で終わった場合は続き位置を返し、呼び側が再開する
+    Ok((merged, cur.until_id))
 }
 
 impl eframe::App for NmnlApp {

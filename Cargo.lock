@@ -2456,6 +2456,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml",
+ "url",
  "urlencoding",
  "uuid",
 ]

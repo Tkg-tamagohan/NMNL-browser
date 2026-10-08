@@ -29,6 +29,7 @@ futures-util = "0.3"
 # reqwest と同じく webpki-roots 系で統一する
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # WS URL のトークンを ?i= に載せるときのパーセントエンコード用(MIT)
+url = "2"
 urlencoding = "2"
 
 [dev-dependencies]

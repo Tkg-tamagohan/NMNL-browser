@@ -26,44 +26,61 @@ const MAX_REDIRECTS: u32 = 5;
 /// メモリキャッシュ。HashMap + 挿入順キューの簡易 LRU(F-09-3)。
 /// ヒット時にキーを末尾へ積み直し、上限超過で最古参照から捨てる
 struct MemCache {
-    map: HashMap<String, Entry>,
-    order: std::collections::VecDeque<String>,
+    /// uri → (エントリ, アクセス順序番号)
+    map: HashMap<String, (Entry, u64)>,
+    /// 順序番号 → uri(eviction は先頭から)
+    lru: std::collections::BTreeMap<u64, String>,
+    next: u64,
 }
 
 impl MemCache {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
-            order: std::collections::VecDeque::new(),
+            lru: std::collections::BTreeMap::new(),
+            next: 0,
         }
     }
 
+    /// ヒットしたキーを最新順の末尾へ移す(重複せず同一キー 1 エントリ)
     fn get(&mut self, uri: &str) -> Option<&Entry> {
-        if self.map.contains_key(uri) {
-            self.order.push_back(uri.to_owned());
-        }
-        self.map.get(uri)
+        let old_seq = self.map.get(uri)?.1;
+        let new_seq = self.next;
+        self.next += 1;
+        self.lru.remove(&old_seq);
+        self.lru.insert(new_seq, uri.to_owned());
+        let entry = self.map.get_mut(uri).unwrap();
+        entry.1 = new_seq;
+        Some(&entry.0)
     }
 
     fn insert(&mut self, uri: String, entry: Entry) {
-        self.map.insert(uri.clone(), entry);
-        self.order.push_back(uri);
+        let seq = self.next;
+        self.next += 1;
+        // 上書き時は古い順序番号を外してから登録し直す
+        if let Some((_, old_seq)) = self.map.get(&uri) {
+            self.lru.remove(old_seq);
+        }
+        self.map.insert(uri.clone(), (entry, seq));
+        self.lru.insert(seq, uri);
+        // 上限超過は最古アクセスから落とす(キーとマップは同じ上限で維持)
         while self.map.len() > MEM_CACHE_CAP {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((_, oldest_uri)) = self.lru.pop_first() else {
                 break;
             };
-            // 二重登録された古いキーも既に map に無いなら no-op で読み飛ばす
-            self.map.remove(&oldest);
+            self.map.remove(&oldest_uri);
         }
     }
 
     fn remove(&mut self, uri: &str) {
-        self.map.remove(uri);
+        if let Some((_, seq)) = self.map.remove(uri) {
+            self.lru.remove(&seq);
+        }
     }
 
     fn clear(&mut self) {
         self.map.clear();
-        self.order.clear();
+        self.lru.clear();
     }
 }
 
@@ -97,10 +114,12 @@ impl CachedImageLoader {
             cache: Arc::new(Mutex::new(MemCache::new())),
             cache_dir,
             runtime,
-            // リダイレクトは手動で追う。ホップごとにスキームと宛先 IP を
-            // 再検証して SSRF の迂回を防ぐ(N-02)
+            // リダイレクトは手動で追い、ホップごとにスキームと宛先を再検証。
+            // DNS 解決は接続時に独自リゾルバが行うので、検証と接続の間の
+            // 再解決差し替え(TOCTOU/DNS rebinding)も塞がれる(N-02)
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
@@ -136,7 +155,7 @@ impl CachedImageLoader {
             .lock()
             .map
             .values()
-            .map(|e| match e {
+            .map(|(e, _)| match e {
                 Entry::Ready(b, _) => b.len(),
                 _ => 0,
             })
@@ -269,7 +288,7 @@ impl BytesLoader for CachedImageLoader {
             .lock()
             .map
             .values()
-            .any(|e| matches!(e, Entry::Pending))
+            .any(|(e, _)| matches!(e, Entry::Pending))
     }
 }
 
@@ -309,46 +328,53 @@ fn is_public_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-/// URL の宛先を検証する。https のみ許可し、ホストが非グローバル IP に
-/// 解決される場合は拒否する(IP リテラル直打ちも同じ検査に通す)
+/// reqwest の DNS リゾルバ。接続時の名前解決で非グローバル IP を弾く
+/// (URL 検証後に DNS 答えが変わる再バインド攻撃を接続側で封じる)
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?
+                .filter(|sa| is_public_ip(&sa.ip()))
+                .collect();
+            if addrs.is_empty() {
+                return Err("内部宛ての URL は拒否".to_string().into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// URL の宛先を検証する。https のみ許可し、IP リテラル直打ちの
+/// 非グローバル宛てを拒否する(ドメインは接続時リゾルバが担保する)
 async fn validate_image_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("URL が不正: {e}"))?;
     if parsed.scheme() != "https" {
         return Err("http スキームは許可しない".to_owned());
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "ホスト名がありません".to_owned())?;
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if !is_public_ip(&ip) {
-            return Err("内部宛ての URL は拒否".to_owned());
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) if !is_public_ip(&std::net::IpAddr::V4(ip)) => {
+            Err("内部宛ての URL は拒否".to_owned())
         }
-        return Ok(());
-    }
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    // DNS 解決して宛先 IP を検査する。接続時の再解決との差(TOCTOU)は
-    // 残存リスクとして受容する(クライアント側 fetcher の実務的な緩和)
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            let mut saw_public = false;
-            for sa in addrs {
-                if !is_public_ip(&sa.ip()) {
-                    return Err("内部宛ての URL は拒否".to_owned());
-                }
-                saw_public = true;
-            }
-            if saw_public {
-                Ok(())
-            } else {
-                Err("名前解決できません".to_owned())
-            }
+        Some(url::Host::Ipv6(ip)) if !is_public_ip(&std::net::IpAddr::V6(ip)) => {
+            Err("内部宛ての URL は拒否".to_owned())
         }
-        Err(e) => Err(format!("名前解決に失敗: {e}")),
+        None => Err("ホスト名がありません".to_owned()),
+        _ => Ok(()),
     }
 }
 
 /// URI を解決して Entry を返す非同期部。メモリに無いときだけ呼ばれる
 async fn load_uri(client: reqwest::Client, cache_dir: PathBuf, uri: &str, path: &PathBuf) -> Entry {
+    // ディスクヒット前に宛先検証を通す(過去に保存済みの内部宛て画像も
+    // ここで弾く。ディスクキャッシュは URL ハッシュで引くため検証不能)
+    if let Err(e) = validate_image_url(uri).await {
+        return Entry::Failed(e);
+    }
     // ディスクヒット(mtime を更新して LRU 順を維持する)
     if let Ok(bytes) = std::fs::read(path)
         && !bytes.is_empty()
@@ -457,5 +483,51 @@ mod tests {
         assert!(validate_image_url("https://10.0.0.5/a.png").await.is_err());
         assert!(validate_image_url("https://[::1]/a.png").await.is_err());
         assert!(validate_image_url("not-a-url").await.is_err());
+    }
+
+    /// MED-04: ディスクヒットでも宛先検証が先に走る(過去保存済みの
+    /// 内部宛て画像を再生しない。検証通過後にのみディスクを読む)
+    #[tokio::test]
+    async fn med04_disk_hit_still_validates() {
+        // 内部宛て URL の「既存キャッシュ」を偽装して置く
+        let dir = std::env::temp_dir().join("nmnl-test-med04");
+        let _ = std::fs::create_dir_all(&dir);
+        let key = CachedImageLoader::cache_key("https://127.0.0.1/x.png");
+        let path = dir.join(&key);
+        std::fs::write(&path, b"PNG").unwrap();
+        let entry = load_uri(
+            reqwest::Client::new(),
+            dir.clone(),
+            "https://127.0.0.1/x.png",
+            &path,
+        )
+        .await;
+        match entry {
+            Entry::Failed(_) => {}
+            _ => panic!("内部宛てはディスクヒットの前に拒否されるべき"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// MED-05: メモリキャッシュのアクセス順はヒットで重複登録せず、
+    /// 上限超過は最古アクセスから確実に落とす(LRU の厳密性)
+    #[test]
+    fn med05_mem_cache_lru_exact() {
+        let mut cache = MemCache::new();
+        for i in 0..MEM_CACHE_CAP {
+            cache.insert(format!("u{i}"), Entry::Pending);
+        }
+        // 同一キーの連続ヒットは順序キューを膨張させない
+        for _ in 0..100 {
+            cache.get("u0");
+        }
+        assert_eq!(cache.lru.len(), MEM_CACHE_CAP);
+        // u0 は直近アクセス済みなので、新規 1 件の挿入で落ちるのは u1
+        cache.insert("new".to_owned(), Entry::Pending);
+        assert!(cache.map.contains_key("u0"));
+        assert!(!cache.map.contains_key("u1"));
+        assert!(cache.map.contains_key("new"));
+        assert_eq!(cache.map.len(), MEM_CACHE_CAP);
+        assert_eq!(cache.lru.len(), MEM_CACHE_CAP);
     }
 }

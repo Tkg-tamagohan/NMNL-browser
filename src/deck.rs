@@ -161,9 +161,13 @@ pub struct Column {
     pub items: ColumnItems,
     /// 表示中・バッファ中を含む既受信 ID(dedup 用)
     seen_ids: SeenIds,
-    /// 切断時点の最新 ID(再接続時の欠落補充の起点。復帰までの新着に
-    /// 追い抜かれないよう切り離して保持する)
+    /// 切断時点の最新 ID(再接続時の欠落補充の起点。補充が完走するまで
+    /// 保持し、再切断で上書きしない)
     pub backfill_since: Option<String>,
+    /// 複数ページ補充の途中位置。上限で止まったらここから続きを取る
+    pub backfill_until: Option<String>,
+    /// 一時停止バッファが溢れて新着を捨てた。解除時に REST 補充する印
+    pub pending_overflow: bool,
     /// invalidate ごとに増える世代番号。飛行中の REST 結果を破棄する印
     pub fetch_gen: u64,
     /// 既受信の最新 ID(欠落補充 sinceId の起点)
@@ -203,6 +207,8 @@ impl Column {
             items,
             seen_ids: SeenIds::new(),
             backfill_since: None,
+            backfill_until: None,
+            pending_overflow: false,
             fetch_gen: 0,
             newest_id: None,
             oldest_id: None,
@@ -265,6 +271,9 @@ impl Column {
         if self.paused {
             if self.pending_notes.len() < PENDING_CAP {
                 self.pending_notes.push_back(note);
+            } else {
+                // 保留が溢れた分は捨てるが、解除時に REST 補充で拾う印を立てる
+                self.pending_overflow = true;
             }
             return false;
         }
@@ -356,6 +365,8 @@ impl Column {
             if self.paused {
                 if self.pending_notes.len() < PENDING_CAP {
                     self.pending_notes.push_back(note);
+                } else {
+                    self.pending_overflow = true;
                 }
                 continue;
             }
@@ -407,6 +418,8 @@ impl Column {
             if self.paused {
                 if self.pending_notifs.len() < PENDING_CAP {
                     self.pending_notifs.push_back(n);
+                } else {
+                    self.pending_overflow = true;
                 }
                 continue;
             }
@@ -431,6 +444,8 @@ impl Column {
         if self.paused {
             if self.pending_notifs.len() < PENDING_CAP {
                 self.pending_notifs.push_back(n);
+            } else {
+                self.pending_overflow = true;
             }
             return false;
         }
@@ -450,7 +465,9 @@ impl Column {
         self.pending_notes.len() + self.pending_notifs.len()
     }
 
-    /// 一時停止の切り替え(F-02-2)。解除時に保留分を合成する
+    /// 一時停止の切り替え(F-02-2)。解除時に保留分を合成する。
+    /// 保留が溢れて捨てた分があれば解除時に補充起点を立てる
+    /// (捨てた側は保留先頭より新しい区間なので、その ID から補充する)
     pub fn set_paused(&mut self, paused: bool) {
         if self.paused && !paused {
             while let Some(n) = self.pending_notes.pop_front() {
@@ -460,6 +477,12 @@ impl Column {
                 if let ColumnItems::Notifications(items) = &mut self.items {
                     let pos = items.partition_point(|existing| existing.id > n.id);
                     items.insert(pos, n);
+                }
+            }
+            if self.pending_overflow {
+                self.pending_overflow = false;
+                if self.backfill_since.is_none() {
+                    self.backfill_since = self.newest_id.clone();
                 }
             }
         }
@@ -498,6 +521,8 @@ impl Column {
         self.error = None;
         self.view = ColumnView::default();
         self.backfill_since = None;
+        self.backfill_until = None;
+        self.pending_overflow = false;
         self.fetch_gen += 1;
         self.dirty = true;
     }
@@ -1059,5 +1084,22 @@ mod tests {
         // 復元したカラムはフィルタが効いた状態で再構成される
         let deck2 = ColumnDeck::from_specs(deck.specs());
         assert!(deck2.columns[0].ntf_filter.excluded.contains("reaction"));
+    }
+
+    /// COL-17: 一時停止バッファが溢れたら解除時に補充起点を立てる。
+    /// 捨てた分は保留先頭より新しい区間なので、その新 ID を sinceId にする
+    #[test]
+    fn col17_pending_overflow_marks_backfill() {
+        let mut col = tl_column();
+        col.set_paused(true);
+        for i in 0..PENDING_CAP + 1 {
+            col.push_note(note(&format!("n{i:04}")));
+        }
+        assert!(col.pending_overflow);
+        col.set_paused(false);
+        assert!(!col.pending_overflow);
+        // 保留先頭(=直近の新着)以降の欠落を拾うためその ID が起点になる
+        assert_eq!(col.backfill_since, col.newest_id);
+        assert_eq!(col.backfill_since.as_deref(), Some("n0499"));
     }
 }
