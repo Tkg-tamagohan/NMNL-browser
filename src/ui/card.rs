@@ -47,16 +47,7 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
         .stroke(Stroke::new(1.0f32, Color32::from_rgb(0x32, 0x34, 0x3c)))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(8, 6));
-    // カード本体クリックの判定は子描画の「前」に登録する。egui の
-    // hit test は同一センスの重なりを後に登録した widget が勝つため、
-    // 描画後に全領域 interact すると子ボタン(CW/閲覧注意/↗等)が潰れる。
-    // 先に登録しておけば子が自分の領域を上書きし、余白クリックのみカード判定になる
-    let card_resp = ui.interact(
-        ui.available_rect_before_wrap(),
-        egui::Id::new(("note_card", col_id, &note.id)),
-        Sense::click(),
-    );
-    frame.show(ui, |ui| {
+    let inner = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
         if note.is_pure_renote()
             && let Some(target) = &note.renote
@@ -72,10 +63,43 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
             body(ui, note, ctx, col_id, false);
         }
     });
-    // カード本体クリックで会話ビュー(F-05-5)。ボタン類の応答とは重ならない領域
-    if card_resp.clicked() {
-        ctx.ops
-            .push(UiOp::OpenConversation(col_id, note.id.clone()));
+    // カード本体クリックで会話ビュー(F-05-5)。全領域の interact は
+    // 最後に登録すると子ボタンを潰し、最初に登録するとラベルやフレームの
+    // hover-sense widget に負けるので、子が侵入しないフレーム外周の
+    // マージン帯(inner_margin: 横 8px・縦 6px)だけをクリック領域にする
+    let outer = inner.response.rect;
+    let margin = egui::Margin::symmetric(8, 6);
+    let bands = [
+        // 左右の帯
+        egui::Rect::from_min_max(
+            outer.min,
+            egui::pos2(outer.min.x + margin.left as f32, outer.max.y),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(outer.max.x - margin.right as f32, outer.min.y),
+            outer.max,
+        ),
+        // 上下の帯(角の重複は許容)
+        egui::Rect::from_min_max(
+            outer.min,
+            egui::pos2(outer.max.x, outer.min.y + margin.top as f32),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(outer.min.x, outer.max.y - margin.bottom as f32),
+            outer.max,
+        ),
+    ];
+    for (i, band) in bands.iter().enumerate() {
+        let resp = ui.interact(
+            *band,
+            egui::Id::new(("note_card", col_id, &note.id, i)),
+            Sense::click(),
+        );
+        if resp.clicked() {
+            ctx.ops
+                .push(UiOp::OpenConversation(col_id, note.id.clone()));
+        }
+        resp.on_hover_text("会話を表示");
     }
 }
 
@@ -246,6 +270,14 @@ fn body(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64, _bannered: b
     // 外部ブラウザで開くリンクのみ有効にしておく
     ui.horizontal(|ui| {
         let url = note.url.clone().or_else(|| note.uri.clone());
+        if ui
+            .button(RichText::new("💬").size(12.0))
+            .on_hover_text("会話を表示")
+            .clicked()
+        {
+            ctx.ops
+                .push(UiOp::OpenConversation(col_id, note.id.clone()));
+        }
         if let Some(u) = url
             && ui
                 .button(RichText::new("↗").size(12.0))
