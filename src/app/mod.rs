@@ -747,10 +747,10 @@ impl NmnlApp {
         self.runtime.spawn(async move {
             let outcome = match client.emoji(&name).await {
                 Ok(e) => EmojiFetch::Found(e.url),
-                // io 実測: 存在しない絵文字名は INTERNAL_ERROR で返る
-                Err(api::ApiError::Server { code, .. })
-                    if code == "INTERNAL_ERROR" || code == "NO_SUCH_EMOJI" =>
-                {
+                // 不在を明示するコードだけ否定キャッシュする。io 実測では
+                // 存在しない名も INTERNAL_ERROR で返るが、サーバー障害と
+                // 区別できないので INTERNAL_ERROR は再試行対象とする
+                Err(api::ApiError::Server { code, .. }) if code == "NO_SUCH_EMOJI" => {
                     EmojiFetch::Missing
                 }
                 Err(_) => EmojiFetch::Transient,
@@ -942,11 +942,12 @@ impl NmnlApp {
                 if let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == id) {
                     let picker = col.channel_picker.get_or_insert_with(Default::default);
                     picker.query = q.clone();
-                    picker.loading = !q.is_empty();
+                    picker.loading = true;
+                    // 空クエリは io で全件一覧が返る。クリア時に前回の結果を
+                    // 残さないよう空でも検索を再発行して表示を揃える
+                    picker.results.clear();
                 }
-                if !q.is_empty() {
-                    self.spawn_channel_search(id, q, ctx);
-                }
+                self.spawn_channel_search(id, q, ctx);
             }
             UiOp::OpenUrl(u) => {
                 let _ = open::that(&u);
@@ -1362,7 +1363,12 @@ impl NmnlApp {
             AppEvent::EmojiResult { name, outcome } => match outcome {
                 EmojiFetch::Found(url) => self.emoji_cache.complete(&name, Some(url)),
                 EmojiFetch::Missing => self.emoji_cache.complete(&name, None),
-                EmojiFetch::Transient => self.emoji_cache.fail_transient(&name),
+                EmojiFetch::Transient => {
+                    self.emoji_cache.fail_transient(&name);
+                    // クールダウン満了時に resolve が再要求できるよう、
+                    // 期限時刻の再描画を予約する(放置だと再試行が走らない)
+                    ctx.request_repaint_after(emoji::RETRY_COOLDOWN);
+                }
             },
             AppEvent::PostResult {
                 result,

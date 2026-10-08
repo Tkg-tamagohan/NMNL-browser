@@ -8,7 +8,12 @@ use std::time::{Duration, Instant};
 
 /// 一時失敗(429・ネットワーク等)を恒久否定にしないための再試行間隔。
 /// なしだと描画ごとに再要求が走りリクエスト嵐になる
-const RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+pub const RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// 一時失敗の再試行上限。io は存在しない絵文字名にも INTERNAL_ERROR を返すので、
+/// そのまま無限再試行すると「存在しない名前」を延々と問い合わせ続ける。
+/// 回数上限を超えたら不在扱い(否定キャッシュ)に倒す
+const MAX_TRANSIENT_ATTEMPTS: u8 = 5;
 
 /// アプリ全体の絵文字 URL キャッシュ。
 /// `None` は「サーバーに存在しない(404 など)」のキャッシュで、繰り返し
@@ -18,8 +23,8 @@ pub struct EmojiCache {
     resolved: HashMap<String, Option<String>>,
     /// 取得を投げた名前一覧(重複リクエスト防止)
     in_flight: HashSet<String>,
-    /// 一時失敗で再試行を待つ名前と再試行可能時刻
-    retry_after: HashMap<String, Instant>,
+    /// 一時失敗で再試行を待つ名前と(再試行可能時刻, 失敗回数)
+    retry_after: HashMap<String, (Instant, u8)>,
 }
 
 impl EmojiCache {
@@ -39,7 +44,7 @@ impl EmojiCache {
         if let Some(url) = self.resolved.get(name) {
             return url.clone();
         }
-        if let Some(&at) = self.retry_after.get(name) {
+        if let Some(&(at, _)) = self.retry_after.get(name) {
             if Instant::now() < at {
                 return None;
             }
@@ -49,10 +54,17 @@ impl EmojiCache {
         None
     }
 
-    /// 一時的な失敗(429、通信障害など)を記録し、クールダウン後に再試行する
+    /// 一時的な失敗(429、通信障害など)を記録し、クールダウン後に再試行する。
+    /// 上限回数を超えたら不在扱いにして打ち切る
     pub fn fail_transient(&mut self, name: &str) {
-        self.retry_after
-            .insert(name.to_owned(), Instant::now() + RETRY_COOLDOWN);
+        let attempts = self.retry_after.get(name).map(|&(_, n)| n).unwrap_or(0) + 1;
+        if attempts >= MAX_TRANSIENT_ATTEMPTS {
+            self.retry_after.remove(name);
+            self.resolved.insert(name.to_owned(), None);
+        } else {
+            self.retry_after
+                .insert(name.to_owned(), (Instant::now() + RETRY_COOLDOWN, attempts));
+        }
     }
 
     /// 取得待ちの名前一覧を取り出してクリアする(app の update で回収)
@@ -137,7 +149,7 @@ mod tests {
         assert!(c.drain_pending().is_empty());
         // クールダウン経過: 再要求される(否定キャッシュにならない)
         c.retry_after
-            .insert("a".to_owned(), Instant::now() - Duration::from_secs(1));
+            .insert("a".to_owned(), (Instant::now() - Duration::from_secs(1), 1));
         assert!(c.resolve("a").is_none());
         assert_eq!(c.drain_pending(), vec!["a".to_owned()]);
     }
@@ -149,5 +161,19 @@ mod tests {
         c.complete("a", None);
         assert!(c.resolve("a").is_none());
         assert!(c.drain_pending().is_empty());
+    }
+
+    // EMO-03: 一時失敗が上限回数に達したら不在扱いに倒す(io は存在しない名にも
+    // INTERNAL_ERROR を返すので、無限再試行しない)
+    #[test]
+    fn emo03_transient_gives_up_after_cap() {
+        let mut c = EmojiCache::default();
+        for _ in 0..MAX_TRANSIENT_ATTEMPTS {
+            c.fail_transient("a");
+        }
+        // 否定キャッシュに倒れて再要求されない
+        assert!(c.resolve("a").is_none());
+        assert!(c.drain_pending().is_empty());
+        assert!(c.retry_after.is_empty());
     }
 }
