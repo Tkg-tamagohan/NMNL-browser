@@ -1251,7 +1251,7 @@ mod tests {
         ]);
         deck.take_dirty();
         let ids: Vec<u64> = deck.columns.iter().map(|c| c.id).collect();
-        let kind_at = |d: &ColumnDeck, i: usize| d.columns[i].spec.kind.clone();
+        let kind_at = |d: &ColumnDeck, i: usize| d.columns[i].spec.kind;
 
         // 中央を右へ → 1 つ右と交換
         deck.move_delta(ids[1], 1);
