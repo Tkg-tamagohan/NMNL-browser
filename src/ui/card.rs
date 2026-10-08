@@ -17,6 +17,10 @@ pub struct CardState {
     pub cw_open: HashSet<String>,
     /// サムネイルを展開したセンシティブメディア(file id)
     pub media_open: HashSet<String>,
+    /// 現在描画中のカード内の「クリック可能な子 widget」の矩形。
+    /// カード内部クリックの会話遷移(F-05-5)で、これらの領域への
+    /// クリックは子に委ねるための除外ゾーン
+    pub click_exclusions: Vec<egui::Rect>,
 }
 
 /// 表示対象のメディア分類。F-08-3 の外部ブラウザ起動対象かどうかの判定に使う
@@ -42,6 +46,8 @@ fn media_kind(file: &DriveFile) -> MediaKind {
 
 /// ノート 1 件の描画。パブリックインターフェース
 pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
+    // このカードの除外ゾーンを仕切り直す(子が描画中に矩形を積む)
+    ctx.card_state.click_exclusions.clear();
     let frame = Frame::group(ui.style())
         .fill(Color32::from_rgb(0x22, 0x24, 0x2a))
         .stroke(Stroke::new(1.0f32, Color32::from_rgb(0x32, 0x34, 0x3c)))
@@ -63,43 +69,37 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
             body(ui, note, ctx, col_id, false);
         }
     });
-    // カード本体クリックで会話ビュー(F-05-5)。全領域の interact は
-    // 最後に登録すると子ボタンを潰し、最初に登録するとラベルやフレームの
-    // hover-sense widget に負けるので、子が侵入しないフレーム外周の
-    // マージン帯(inner_margin: 横 8px・縦 6px)だけをクリック領域にする
-    let outer = inner.response.rect;
-    let margin = egui::Margin::symmetric(8, 6);
-    let bands = [
-        // 左右の帯
-        egui::Rect::from_min_max(
-            outer.min,
-            egui::pos2(outer.min.x + margin.left as f32, outer.max.y),
-        ),
-        egui::Rect::from_min_max(
-            egui::pos2(outer.max.x - margin.right as f32, outer.min.y),
-            outer.max,
-        ),
-        // 上下の帯(角の重複は許容)
-        egui::Rect::from_min_max(
-            outer.min,
-            egui::pos2(outer.max.x, outer.min.y + margin.top as f32),
-        ),
-        egui::Rect::from_min_max(
-            egui::pos2(outer.min.x, outer.max.y - margin.bottom as f32),
-            outer.max,
-        ),
-    ];
-    for (i, band) in bands.iter().enumerate() {
-        let resp = ui.interact(
-            *band,
-            egui::Id::new(("note_card", col_id, &note.id, i)),
-            Sense::click(),
-        );
-        if resp.clicked() {
-            ctx.ops
-                .push(UiOp::OpenConversation(col_id, note.id.clone()));
+    // カード本体クリックで会話ビュー(F-05-5)。widget の interact では
+    // 子ボタンやラベルの hover-sense widget が遮る/遮られるため、
+    // リリース位置と除外ゾーン(クリック可能な子の矩形)で判定する。
+    // 純粋リノートは表示対象(リノート元)と同じ会話を開く
+    let conv_id = if note.is_pure_renote() {
+        note.renote.as_ref().map(|r| r.id.clone())
+    } else {
+        None
+    }
+    .unwrap_or_else(|| note.id.clone());
+    let card_rect = inner.response.rect;
+    // クリック = カード内で押下を開始し、カード内でリリース
+    let released = ui.ctx().input(|i| {
+        i.pointer.primary_released()
+            && i.pointer
+                .press_origin()
+                .is_some_and(|p| card_rect.contains(p))
+            && i.pointer
+                .latest_pos()
+                .is_some_and(|p| card_rect.contains(p))
+    });
+    if released {
+        let pos = ui.ctx().pointer_latest_pos().unwrap_or_default();
+        if !ctx
+            .card_state
+            .click_exclusions
+            .iter()
+            .any(|r| r.contains(pos))
+        {
+            ctx.ops.push(UiOp::OpenConversation(col_id, conv_id));
         }
-        resp.on_hover_text("会話を表示");
     }
 }
 
@@ -205,16 +205,13 @@ fn body(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64, _bannered: b
             };
             // Button は既定で折り返さないので、長い CW 文が領域を超えて
             // 確保矩形を広げる(カラム自体が太くなる)のを .wrap() で防ぐ
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(label).color(Color32::from_rgb(0xf0, 0xc0, 0x60)),
-                    )
+            let cw_resp = ui.add(
+                egui::Button::new(RichText::new(label).color(Color32::from_rgb(0xf0, 0xc0, 0x60)))
                     .wrap()
                     .frame(false),
-                )
-                .clicked()
-            {
+            );
+            ctx.card_state.click_exclusions.push(cw_resp.rect);
+            if cw_resp.clicked() {
                 if open {
                     ctx.card_state.cw_open.remove(&note.id);
                 } else {
@@ -332,17 +329,16 @@ fn image_thumb(ui: &mut Ui, file: &DriveFile, w: f32, ctx: &mut UiCtx<'_>) {
     let opened = ctx.card_state.media_open.contains(&file.id);
     if file.is_sensitive && !opened {
         let label = format!("⚠ 閲覧注意: {}", file.name);
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new(label)
-                        .size(11.0)
-                        .color(Color32::from_rgb(0xf0, 0xa0, 0x80)),
-                )
-                .wrap(),
+        let resp = ui.add(
+            egui::Button::new(
+                RichText::new(label)
+                    .size(11.0)
+                    .color(Color32::from_rgb(0xf0, 0xa0, 0x80)),
             )
-            .clicked()
-        {
+            .wrap(),
+        );
+        ctx.card_state.click_exclusions.push(resp.rect);
+        if resp.clicked() {
             ctx.card_state.media_open.insert(file.id.clone());
         }
         return;
@@ -353,6 +349,7 @@ fn image_thumb(ui: &mut Ui, file: &DriveFile, w: f32, ctx: &mut UiCtx<'_>) {
         let resp = ui
             .add(egui::Image::new(src).max_width(w).corner_radius(4.0))
             .interact(Sense::click());
+        ctx.card_state.click_exclusions.push(resp.rect);
         if resp.clicked()
             && let Some(u) = &file.url
         {

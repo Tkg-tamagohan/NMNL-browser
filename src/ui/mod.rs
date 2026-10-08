@@ -165,7 +165,12 @@ fn header(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
             // drag_source にすると全領域の interact が子ボタンより
             // 後に登録され、hit test でクリックが奪われる(egui 0.32)
             ui.dnd_drag_source(egui::Id::new(("col_drag", id)), id, |ui| {
-                ui.label(RichText::new("≡").color(Color32::GRAY));
+                // グリフ単体だと掴める範囲が文字幅分しかなく小さいので、
+                // 一定サイズのヒット領域を持たせる
+                ui.add_sized(
+                    egui::vec2(18.0, 16.0),
+                    egui::Label::new(RichText::new("≡").color(Color32::GRAY)),
+                );
             });
             ui.label(RichText::new(col.title()).strong());
             if col.pending_count() > 0 {
