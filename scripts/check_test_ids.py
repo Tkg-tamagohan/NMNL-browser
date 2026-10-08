@@ -30,11 +30,14 @@ LEDGER_HEADING = "## テスト ID 帳簿"
 SCAN_DIRS = ("src", "mock")
 
 # 接頭辞 2〜5 文字・番号 2〜3 桁の制約で要件 ID(F-01、N-01 系)、UTF-8、
-# ISO-8601 等の非 ID を除く。前後は単語文字とハイフンを排除し、
-# FOO-BAR-01 の末尾や XPOST-01 の部分一致を除く。
-ID_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9-])[A-Z]{2,5}-\d{2,3}(?![0-9-])")
-LEDGER_ID_RE = re.compile(r"(?<![A-Za-z0-9-])([A-Z]{2,5}-\d{2,3})(?![0-9-])\s*:")
+# ISO-8601 等の非 ID を除く。前後は単語文字・アンダースコア・ハイフンを排除し、
+# FOO-BAR-01 の末尾や ZZZ-01suffix のような部分一致を除く。
+ID_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Z]{2,5}-\d{2,3}(?![A-Za-z0-9_-])")
+LEDGER_ID_RE = re.compile(r"(?<![A-Za-z0-9_-])([A-Z]{2,5}-\d{2,3})(?![A-Za-z0-9_-])\s*:")
 CHAR_LIT_RE = re.compile(r"'(?:\\.|[^'\\])'")
+# Rust の raw 文字列の開始(r"、r#"、r##"、br"、br#" ...)。
+# b"..."(バイト文字列)は通常文字列扱いなので対象外。
+RAW_STR_OPEN_RE = re.compile(r"(?:br|r)#*\"")
 NO_TEST_MARKERS = ("単体テストなし", "実機検証")
 
 
@@ -93,6 +96,17 @@ def comment_part(line: str) -> str:
         if c == '"':
             in_str = True
             i += 1
+            continue
+        m = RAW_STR_OPEN_RE.match(line, i)
+        if m:
+            # raw 文字列は開始と同数の # 付き引用符で閉じる(r#"..."#)。
+            # エスケープは効かないため内容中の " もそのまま扱う。
+            hashes = m.group(0).count("#")
+            close = line.find('"' + "#" * hashes, m.end())
+            if close == -1:
+                # 行内に閉じがない=残りは文字列内(複数行 raw は対象外)。
+                return ""
+            i = close + 1 + hashes
             continue
         if c == "'":
             m = CHAR_LIT_RE.match(line, i)
