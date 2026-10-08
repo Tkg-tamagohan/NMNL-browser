@@ -165,6 +165,20 @@ impl Note {
             && self.files.is_empty()
             && self.file_ids.is_empty()
     }
+
+    /// 返信/引用/リノートの投稿先に継承するチャンネル(F-06-4、仕様決定 W)。
+    /// 埋め込み channel を優先し、channel_id のみを持つノートは最小構成の
+    /// NoteChannel に変換する
+    pub fn channel_for_inherit(&self) -> Option<NoteChannel> {
+        self.channel.clone().or_else(|| {
+            self.channel_id.clone().map(|id| NoteChannel {
+                id,
+                name: None,
+                color: None,
+                is_sensitive: false,
+            })
+        })
+    }
 }
 
 /// リアクションキーの解釈(F-07-4)。

@@ -1697,8 +1697,11 @@ impl eframe::App for NmnlApp {
         if matches!(self.auth, AuthState::Authenticated { .. }) {
             self.bootstrap_streaming(ctx);
         }
-        // ウィンドウサイズを設定に反映しておく(終了時に保存)
-        let size = ctx.input(|i| i.screen_rect().size());
+        // ウィンドウサイズを設定に反映しておく(終了時に保存)。
+        // screen_rect は zoom 適用後の egui ポイントなので、保存値は
+        // zoom_factor を掛けてネイティブ論理サイズに戻す
+        // (そのまま保存すると再起動のたびにサイズがずれる)
+        let size = ctx.input(|i| i.screen_rect().size()) * ctx.zoom_factor();
         if size.x > 0.0 && size.y > 0.0 {
             self.config.window.width = size.x;
             self.config.window.height = size.y;

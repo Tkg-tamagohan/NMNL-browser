@@ -359,5 +359,23 @@ mod tests {
         assert_eq!(r.channel_id.as_deref(), Some("ch9"));
         let r = renote_request("n3", None);
         assert!(r.channel_id.is_none());
+
+        // 埋め込み channel を持たず channel_id だけのノートでも
+        // 継承先を解決できる(channel_for_inherit のフォールバック)
+        let n: crate::model::Note = serde_json::from_value(serde_json::json!({
+            "id": "n9",
+            "createdAt": "2026-10-08T00:00:00.000Z",
+            "userId": "u1",
+            "user": { "id": "u1", "username": "alice" },
+            "channelId": "ch_idonly"
+        }))
+        .unwrap();
+        assert!(n.channel.is_none());
+        let ch = n.channel_for_inherit().expect("channel_id から合成される");
+        assert_eq!(ch.id, "ch_idonly");
+        assert_eq!(ch.name, None);
+        let mut c3 = Composer::default();
+        c3.inherit_channel(Some(&ch));
+        assert_eq!(c3.channel_id.as_deref(), Some("ch_idonly"));
     }
 }

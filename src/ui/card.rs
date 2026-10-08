@@ -407,20 +407,20 @@ fn body(
                 id: note.id.clone(),
                 label: label.clone(),
                 // 対象がチャンネル所属なら channelId を継承する(仕様決定 W)
-                channel: note.channel.clone(),
+                channel: note.channel_for_inherit(),
             });
         }
         if btn("🔁", "リノート", ui, ctx).clicked() {
             ctx.ops.push(UiOp::Renote {
                 note_id: note.id.clone(),
-                channel: note.channel.clone(),
+                channel: note.channel_for_inherit(),
             });
         }
         if btn("❝", "引用", ui, ctx).clicked() {
             ctx.ops.push(UiOp::Quote {
                 id: note.id.clone(),
                 label,
-                channel: note.channel.clone(),
+                channel: note.channel_for_inherit(),
             });
         }
         if btn("😀", "リアクション", ui, ctx).clicked() {
