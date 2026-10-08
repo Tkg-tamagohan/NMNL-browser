@@ -63,13 +63,15 @@ pub struct Composer {
 
 impl Composer {
     /// フォーム内容から notes/create のリクエストを作る。
-    /// 本文も添付も引用もない投稿は拒否する(Misskey 側も INVALID_PARAM)
+    /// 本文も添付もない投稿は拒否する(Misskey 側も INVALID_PARAM。
+    /// 引用・返信の参照だけではノートが成立しない — 中身のない
+    /// renote_id 付き投稿は表示上リノートと区別が付かない)
     /// `me_id` は visibility=specified のとき宛先として必須
     pub fn build_request(&self, me_id: Option<&str>) -> Result<CreateNote, String> {
         let text = self.text.trim();
         let has_files = !self.files.is_empty();
-        if text.is_empty() && !has_files && self.quote_of.is_none() {
-            return Err("本文・添付・引用のいずれかが必要です".to_owned());
+        if text.is_empty() && !has_files {
+            return Err("本文または添付が必要です".to_owned());
         }
         let mut req = CreateNote {
             text: if text.is_empty() {
@@ -149,7 +151,7 @@ mod tests {
     use std::path::Path;
 
     // POST-03: フォーム状態→CreateNote の変換。本文のみ/返信+本文/
-    // 引用+添付/specified は visibleUserIds 必須
+    // 引用+本文(引用のみは拒否)/specified は visibleUserIds 必須
     #[test]
     fn post03_composer_to_request() {
         let mut c = Composer::default();
@@ -175,17 +177,20 @@ mod tests {
         // me_id が無いと投稿を止める
         assert!(c.build_request(None).is_err());
 
-        // 引用のみでも投稿可能(本文は空でもよい)
-        let q = Composer {
+        // 引用は本文か添付を伴う場合だけ送れる。引用だけの投稿は
+        // 中身のない renote_id 投稿=純粋リノートと区別が付かないため拒否
+        let mut q = Composer {
             quote_of: Some(PostTarget {
                 id: "n2".to_owned(),
                 label: "y".to_owned(),
             }),
             ..Composer::default()
         };
+        assert!(q.build_request(Some("me")).is_err());
+        q.text = "コメント".to_owned();
         let r = q.build_request(Some("me")).unwrap();
         assert_eq!(r.renote_id.as_deref(), Some("n2"));
-        assert!(r.text.is_none());
+        assert_eq!(r.text.as_deref(), Some("コメント"));
 
         // CW は有効かつ非空のときだけ送る
         c.cw_enabled = true;

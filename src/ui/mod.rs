@@ -174,119 +174,123 @@ fn top_bar(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
 /// セットして同じフォームから投稿する
 fn composer_panel(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
     use crate::composer::{MAX_ATTACHMENTS, visibility_label};
-    ui.horizontal(|ui| {
-        // 返信/引用の対象表示と解除(F-06-3)
-        let mut clear_reply = false;
-        let mut clear_quote = false;
-        if let Some(t) = &ctx.composer.reply_to {
-            ui.label(RichText::new(format!("↩ {} への返信", t.label)).size(11.0));
-            if ui.small_button("×").clicked() {
-                clear_reply = true;
+    // 投稿中は編集を不可にする。成功時にフォーム全体をリセットするため、
+    // 送信中の追記がリクエストに含まれないまま消えるのを防ぐ
+    ui.add_enabled_ui(!ctx.composer.posting, |ui| {
+        ui.horizontal(|ui| {
+            // 返信/引用の対象表示と解除(F-06-3)
+            let mut clear_reply = false;
+            let mut clear_quote = false;
+            if let Some(t) = &ctx.composer.reply_to {
+                ui.label(RichText::new(format!("↩ {} への返信", t.label)).size(11.0));
+                if ui.small_button("×").clicked() {
+                    clear_reply = true;
+                }
             }
-        }
-        if let Some(t) = &ctx.composer.quote_of {
-            ui.label(RichText::new(format!("❝ {} の引用", t.label)).size(11.0));
-            if ui.small_button("×").clicked() {
-                clear_quote = true;
+            if let Some(t) = &ctx.composer.quote_of {
+                ui.label(RichText::new(format!("❝ {} の引用", t.label)).size(11.0));
+                if ui.small_button("×").clicked() {
+                    clear_quote = true;
+                }
             }
-        }
-        if clear_reply {
-            ctx.ops.push(UiOp::ClearTarget(true));
-        }
-        if clear_quote {
-            ctx.ops.push(UiOp::ClearTarget(false));
-        }
-        // CW 切り替え
-        let mut cw_on = ctx.composer.cw_enabled;
-        if ui.checkbox(&mut cw_on, "CW").changed() {
-            ctx.composer.cw_enabled = cw_on;
-        }
-        // 公開範囲(F-06-1)
-        egui::ComboBox::from_id_salt("visibility")
-            .selected_text(visibility_label(ctx.composer.visibility))
-            .show_ui(ui, |ui| {
-                for v in [
-                    crate::model::Visibility::Public,
-                    crate::model::Visibility::Home,
-                    crate::model::Visibility::Followers,
-                    crate::model::Visibility::Specified,
-                ] {
-                    ui.selectable_value(&mut ctx.composer.visibility, v, visibility_label(v));
+            if clear_reply {
+                ctx.ops.push(UiOp::ClearTarget(true));
+            }
+            if clear_quote {
+                ctx.ops.push(UiOp::ClearTarget(false));
+            }
+            // CW 切り替え
+            let mut cw_on = ctx.composer.cw_enabled;
+            if ui.checkbox(&mut cw_on, "CW").changed() {
+                ctx.composer.cw_enabled = cw_on;
+            }
+            // 公開範囲(F-06-1)
+            egui::ComboBox::from_id_salt("visibility")
+                .selected_text(visibility_label(ctx.composer.visibility))
+                .show_ui(ui, |ui| {
+                    for v in [
+                        crate::model::Visibility::Public,
+                        crate::model::Visibility::Home,
+                        crate::model::Visibility::Followers,
+                        crate::model::Visibility::Specified,
+                    ] {
+                        ui.selectable_value(&mut ctx.composer.visibility, v, visibility_label(v));
+                    }
+                });
+            // 添付(D&D、最大 MAX_ATTACHMENTS)
+            ui.label(
+                RichText::new("画像をドロップで添付")
+                    .size(10.0)
+                    .color(Color32::GRAY),
+            );
+            let mut remove_at = None;
+            for (i, f) in ctx.composer.files.iter().enumerate() {
+                ui.label(RichText::new(&f.name).size(10.0));
+                if ui.small_button("×").clicked() {
+                    remove_at = Some(i);
+                }
+            }
+            if let Some(i) = remove_at {
+                ctx.ops.push(UiOp::RemoveAttachment(i));
+            }
+            ui.label(
+                RichText::new(format!("{}/{MAX_ATTACHMENTS}", ctx.composer.files.len()))
+                    .size(10.0)
+                    .color(Color32::GRAY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_post = !ctx.composer.posting;
+                if ui
+                    .add_enabled(can_post, egui::Button::new("投稿"))
+                    .clicked()
+                {
+                    ctx.ops.push(UiOp::PostNote);
                 }
             });
-        // 添付(D&D、最大 MAX_ATTACHMENTS)
-        ui.label(
-            RichText::new("画像をドロップで添付")
-                .size(10.0)
-                .color(Color32::GRAY),
-        );
-        let mut remove_at = None;
-        for (i, f) in ctx.composer.files.iter().enumerate() {
-            ui.label(RichText::new(&f.name).size(10.0));
-            if ui.small_button("×").clicked() {
-                remove_at = Some(i);
-            }
-        }
-        if let Some(i) = remove_at {
-            ctx.ops.push(UiOp::RemoveAttachment(i));
-        }
-        ui.label(
-            RichText::new(format!("{}/{MAX_ATTACHMENTS}", ctx.composer.files.len()))
-                .size(10.0)
-                .color(Color32::GRAY),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let can_post = !ctx.composer.posting;
-            if ui
-                .add_enabled(can_post, egui::Button::new("投稿"))
-                .clicked()
-            {
-                ctx.ops.push(UiOp::PostNote);
-            }
         });
-    });
-    if ctx.composer.cw_enabled {
+        if ctx.composer.cw_enabled {
+            ui.add(
+                egui::TextEdit::singleline(&mut ctx.composer.cw)
+                    .hint_text("注釈(CW)")
+                    .desired_width(f32::INFINITY),
+            );
+        }
         ui.add(
-            egui::TextEdit::singleline(&mut ctx.composer.cw)
-                .hint_text("注釈(CW)")
+            egui::TextEdit::multiline(&mut ctx.composer.text)
+                .hint_text("いまどうしてる?")
+                .desired_rows(2)
                 .desired_width(f32::INFINITY),
         );
-    }
-    ui.add(
-        egui::TextEdit::multiline(&mut ctx.composer.text)
-            .hint_text("いまどうしてる?")
-            .desired_rows(2)
-            .desired_width(f32::INFINITY),
-    );
-    // エラーと通知
-    if let Some(e) = &ctx.composer.error {
-        ui.label(
-            RichText::new(e)
-                .size(10.0)
-                .color(Color32::from_rgb(0xe0, 0x80, 0x80)),
-        );
-    }
-    if let Some(n) = ctx.notice.as_ref() {
-        ui.label(
-            RichText::new(n)
-                .size(10.0)
-                .color(Color32::from_rgb(0x9e, 0xd0, 0x8e)),
-        );
-    }
-    // ドロップ検知(領域全体)
-    let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
-    for f in dropped {
-        if let Some(bytes) = f.bytes {
-            let path = f.path.clone().unwrap_or_else(|| f.name.clone().into());
-            ctx.composer.push_dropped(&path, bytes.to_vec());
-        } else if let Some(path) = f.path {
-            if let Ok(data) = std::fs::read(&path) {
-                ctx.composer.push_dropped(&path, data);
-            } else {
-                ctx.composer.error = Some(format!("読めないファイル: {}", path.display()));
+        // エラーと通知
+        if let Some(e) = &ctx.composer.error {
+            ui.label(
+                RichText::new(e)
+                    .size(10.0)
+                    .color(Color32::from_rgb(0xe0, 0x80, 0x80)),
+            );
+        }
+        if let Some(n) = ctx.notice.as_ref() {
+            ui.label(
+                RichText::new(n)
+                    .size(10.0)
+                    .color(Color32::from_rgb(0x9e, 0xd0, 0x8e)),
+            );
+        }
+        // ドロップ検知(領域全体)
+        let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            if let Some(bytes) = f.bytes {
+                let path = f.path.clone().unwrap_or_else(|| f.name.clone().into());
+                ctx.composer.push_dropped(&path, bytes.to_vec());
+            } else if let Some(path) = f.path {
+                if let Ok(data) = std::fs::read(&path) {
+                    ctx.composer.push_dropped(&path, data);
+                } else {
+                    ctx.composer.error = Some(format!("読めないファイル: {}", path.display()));
+                }
             }
         }
-    }
+    });
 }
 
 /// リアクションピッカー(F-07-2)。検索欄+絵文字グリッドの浮遊ウィンドウ
@@ -295,7 +299,6 @@ fn reaction_picker_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
         return;
     };
     let note_id = state.note_id.clone();
-    let query = state.query.clone();
     let mut open = true;
     let mut pick = None;
     egui::Window::new("リアクションを選択")
@@ -304,13 +307,11 @@ fn reaction_picker_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
         .default_size([280.0, 320.0])
         .open(&mut open)
         .show(egui_ctx, |ui| {
-            let resp = ui
-                .add(egui::TextEdit::singleline(&mut state.query).hint_text("検索(name/aliases)"));
-            if resp.changed() {
-                // クエリの変更は state に書き戻される(フィールド直接編集)
-            }
+            ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("検索(name/aliases)"));
             ui.separator();
-            let q = query.trim().to_lowercase();
+            // クエリは TextEdit が state.query を更新した後に読む
+            // (先にコピーすると絞り込みが 1 フレーム遅れる)
+            let q = state.query.trim().to_lowercase();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {

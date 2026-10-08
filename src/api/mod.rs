@@ -199,21 +199,41 @@ impl ApiClient {
         mime: &str,
         data: Vec<u8>,
     ) -> Result<DriveFile, ApiError> {
-        let part = reqwest::multipart::Part::bytes(data)
-            .file_name(name.to_owned())
-            .mime_str(mime)
-            .map_err(|e| ApiError::Unexpected(e.to_string()))?;
-        let mut form = reqwest::multipart::Form::new().part("file", part);
-        if let Some(token) = &self.token {
-            form = form.text("i", token.clone());
-        }
-        let resp = self
-            .http
-            .post(self.api_url("drive/files/create"))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(ApiError::Network)?;
+        // N-03: 429 は JSON 系と同じく限定的に再試行する
+        // (multipart のフォームは使い回せないため毎回再構築)
+        let mut attempts = 0u32;
+        let resp = loop {
+            let part = reqwest::multipart::Part::bytes(data.clone())
+                .file_name(name.to_owned())
+                .mime_str(mime)
+                .map_err(|e| ApiError::Unexpected(e.to_string()))?;
+            let mut form = reqwest::multipart::Form::new().part("file", part);
+            if let Some(token) = &self.token {
+                form = form.text("i", token.clone());
+            }
+            let resp = self
+                .http
+                .post(self.api_url("drive/files/create"))
+                .multipart(form)
+                .send()
+                .await
+                .map_err(ApiError::Network)?;
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts < MAX_429_RETRIES
+            {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let delay = retry_after
+                    .map(Duration::from_secs)
+                    .unwrap_or(RETRY_429_BASE * 2u32.pow(attempts));
+                tokio::time::sleep(delay).await;
+                attempts += 1;
+                continue;
+            }
+            break resp;
+        };
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.map_err(ApiError::Network)?;

@@ -884,7 +884,10 @@ impl NmnlApp {
                     Ok(req) => {
                         self.composer.error = None;
                         self.notice = None;
-                        let files = std::mem::take(&mut self.composer.files);
+                        // ファイルは clone で渡してフォームに残す。投稿失敗時に
+                        // 添付が消えて再投稿で抜け落ちるのを防ぐ
+                        // (Arc<Vec<u8>> なので clone は浅い)
+                        let files = self.composer.files.clone();
                         self.spawn_post(req, files, ctx);
                     }
                     Err(e) => {
