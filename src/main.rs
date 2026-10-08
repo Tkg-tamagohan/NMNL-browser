@@ -4,6 +4,8 @@ use nmnl_browser::config::AppConfig;
 use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
+    // N-01 の起動時間計測起点
+    let _ = nmnl_browser::STARTED_AT.set(std::time::Instant::now());
     let config = AppConfig::load();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

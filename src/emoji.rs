@@ -92,3 +92,15 @@ pub fn save_emoji_list(list: &[crate::model::Emoji]) {
     }
     let _ = std::fs::write(&path, text);
 }
+
+/// 一覧キャッシュの現在サイズ(設定画面の表示用、F-09-3)
+pub fn emoji_list_bytes() -> u64 {
+    std::fs::metadata(emoji_list_path())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// 一覧キャッシュの消去(F-09-3)
+pub fn clear_emoji_list() {
+    let _ = std::fs::remove_file(emoji_list_path());
+}

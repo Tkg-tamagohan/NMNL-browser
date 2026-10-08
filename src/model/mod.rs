@@ -27,6 +27,18 @@ pub struct User {
     /// 名前装飾用のカスタム絵文字マップ(絵文字名→URL)
     #[serde(default)]
     pub emojis: HashMap<String, String>,
+    // users/show の詳細応答のみ返るフィールド(F-05-6)。
+    // ノート埋め込みの軽量ユーザーには無いので Option
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub notes_count: Option<u32>,
+    #[serde(default)]
+    pub following_count: Option<u32>,
+    #[serde(default)]
+    pub followers_count: Option<u32>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// ノートの公開範囲(F-06-1)

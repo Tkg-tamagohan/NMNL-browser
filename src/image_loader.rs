@@ -100,6 +100,8 @@ pub struct CachedImageLoader {
     cache_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     client: reqwest::Client,
+    /// 消去ごとに進む世代。消去より前に始まった取得は結果を捨てる(MED-06)
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CachedImageLoader {
@@ -114,6 +116,7 @@ impl CachedImageLoader {
             cache: Arc::new(Mutex::new(MemCache::new())),
             cache_dir,
             runtime,
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // リダイレクトは手動で追い、ホップごとにスキームと宛先を再検証。
             // DNS 解決は接続時に独自リゾルバが行うので、検証と接続の間の
             // 再解決差し替え(TOCTOU/DNS rebinding)も塞がれる(N-02)
@@ -129,9 +132,26 @@ impl CachedImageLoader {
 
     /// キャッシュした URI をクリアする(設定画面のキャッシュ消去用、F-09-3)
     pub fn clear_all(&self) {
+        // 世代を進めて、消去前に始まった取得の書き戻しを防ぐ(MED-06)
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.cache.lock().clear();
         let _ = std::fs::remove_dir_all(&self.cache_dir);
         let _ = std::fs::create_dir_all(&self.cache_dir);
+    }
+
+    /// ディスクキャッシュの現在サイズ(設定画面の表示用、F-09-3)
+    pub fn cache_bytes(&self) -> u64 {
+        std::fs::read_dir(&self.cache_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     /// キャッシュキーは sha256 の 16 進。衝突耐性と安定性のため固定ハッシュを使う
@@ -264,10 +284,16 @@ impl BytesLoader for CachedImageLoader {
         let cache = self.cache.clone();
         let client = self.client.clone();
         let cache_dir = self.cache_dir.clone();
+        let generation = self.generation.clone();
+        let gen_at_start = generation.load(std::sync::atomic::Ordering::SeqCst);
         let ctx = ctx.clone();
         self.runtime.spawn(async move {
             let result = load_uri(client, cache_dir, &uri_owned, &path).await;
-            cache.lock().insert(uri_owned, result);
+            // 失敗はメモリキャッシュに残って再試しないので、原因をログに残す
+            if let Entry::Failed(msg) = &result {
+                eprintln!("[image] 取得失敗: {uri_owned} -> {msg}");
+            }
+            store_result(&cache, &generation, gen_at_start, &path, uri_owned, result);
             ctx.request_repaint();
         });
         Ok(BytesPoll::Pending { size: None })
@@ -371,6 +397,24 @@ async fn validate_image_url(url: &str) -> Result<(), String> {
 }
 
 /// URI を解決して Entry を返す非同期部。メモリに無いときだけ呼ばれる
+/// 取得結果をメモリキャッシュへ格納する。
+/// 取得開始時と世代が変わっていた(途中で clear_all が走った)場合は
+/// 書き込まれたディスクファイルも消して採用しない(MED-06)
+fn store_result(
+    cache: &Arc<Mutex<MemCache>>,
+    generation: &std::sync::atomic::AtomicU64,
+    gen_at_start: u64,
+    path: &std::path::Path,
+    uri: String,
+    result: Entry,
+) {
+    if generation.load(std::sync::atomic::Ordering::SeqCst) != gen_at_start {
+        let _ = std::fs::remove_file(path);
+    } else {
+        cache.lock().insert(uri, result);
+    }
+}
+
 async fn load_uri(client: reqwest::Client, cache_dir: PathBuf, uri: &str, path: &PathBuf) -> Entry {
     // ディスクヒット前に宛先検証を通す(過去に保存済みの内部宛て画像も
     // ここで弾く。ディスクキャッシュは URL ハッシュで引くため検証不能)
@@ -531,5 +575,39 @@ mod tests {
         assert!(cache.map.contains_key("new"));
         assert_eq!(cache.map.len(), MEM_CACHE_CAP);
         assert_eq!(cache.lru.len(), MEM_CACHE_CAP);
+    }
+    // MED-06: 消去中に完了した取得は書き戻さない(世代カウンタ、F-09-3)
+    #[test]
+    fn med06_store_result_stale_generation() {
+        let dir = std::env::temp_dir().join(format!("nmnl-med06-{}", std::process::id()));
+        let path = dir.join("f.bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"img").unwrap();
+        let cache = Arc::new(Mutex::new(MemCache::new()));
+        let g = std::sync::atomic::AtomicU64::new(0);
+        // 取得開始(世代0)後に消去で世代1へ → 結果は破棄されファイルも消える
+        g.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        store_result(
+            &cache,
+            &g,
+            0,
+            &path,
+            "u1".to_owned(),
+            Entry::Ready(egui::load::Bytes::from(vec![1u8]), None),
+        );
+        assert!(cache.lock().get("u1").is_none());
+        assert!(!path.exists());
+        // 世代が一致する取得は採用される
+        std::fs::write(&path, b"img").unwrap();
+        store_result(
+            &cache,
+            &g,
+            1,
+            &path,
+            "u2".to_owned(),
+            Entry::Ready(egui::load::Bytes::from(vec![1u8]), None),
+        );
+        assert!(cache.lock().get("u2").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

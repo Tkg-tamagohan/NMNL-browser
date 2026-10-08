@@ -5,7 +5,7 @@
 mod card;
 mod mfm;
 
-pub use card::CardState;
+pub use card::{CardState, display_name};
 pub use mfm::Piece;
 
 use crate::deck::{
@@ -72,6 +72,29 @@ pub enum UiOp {
         reaction: String,
         mine: bool,
     },
+    // Phase 8: ビューア・プロフィール・設定
+    /// 画像ビューアを開く(F-08-1)。files はそのノートの画像全件、index は開始位置
+    OpenViewer {
+        files: Vec<crate::model::DriveFile>,
+        index: usize,
+        /// カード側で既に開封済みのセンシティブ画像のファイル ID(VWR-02)
+        revealed: std::collections::HashSet<String>,
+    },
+    CloseViewer,
+    /// ビューアの画像めくり(-1=前、+1=次)
+    ViewerStep(i32),
+    /// ビューア内でのセンシティブ画像の開封(F-08-1, VWR-02)
+    ViewerReveal(String),
+    /// プロフィールを開く(F-05-6)。user_id で users/show+users/notes を取る
+    OpenProfile {
+        user_id: String,
+    },
+    CloseProfile,
+    /// 設定画面を開閉(F-09-3)
+    OpenSettings,
+    CloseSettings,
+    /// キャッシュの消去(F-09-3)。true=画像、false=絵文字一覧
+    ClearCache(bool),
 }
 
 /// 描画に必要なアプリ状態の参照まとめ
@@ -99,6 +122,40 @@ pub struct UiCtx<'a> {
     pub reaction_picker: &'a mut Option<crate::app::ReactionPickerState>,
     /// 一行通知(投稿成功など)
     pub notice: &'a mut Option<String>,
+    /// 画像ビューアの開閉状態(F-08-1)
+    pub viewer: &'a mut Option<ViewerState>,
+    /// プロフィールの開閉状態(F-05-6)
+    pub profile: &'a mut Option<crate::app::ProfileState>,
+    /// 設定画面の開閉(F-09-3)
+    pub settings_win: &'a mut bool,
+    /// キャッシュの現在サイズ(画像バイト, 絵文字一覧バイト)。設定画面表示用
+    pub cache_sizes: (u64, u64),
+}
+
+/// 画像ビューアの状態(F-08-1)
+#[derive(Debug, Default)]
+pub struct ViewerState {
+    pub files: Vec<crate::model::DriveFile>,
+    pub index: usize,
+    /// カード側で開封済みのセンシティブ画像のファイル ID(VWR-02)
+    pub revealed: std::collections::HashSet<String>,
+}
+
+impl ViewerState {
+    /// 表示してよい画像か(センシティブは開封済みのみ、VWR-02)
+    pub fn is_visible(&self, file: &crate::model::DriveFile) -> bool {
+        !file.is_sensitive || self.revealed.contains(&file.id)
+    }
+
+    /// インデックスを ±1 動かす(範囲にクランプ、VWR-01)
+    pub fn step(&mut self, delta: i32) {
+        if self.files.is_empty() {
+            self.index = 0;
+            return;
+        }
+        let next = self.index as i64 + i64::from(delta);
+        self.index = next.clamp(0, self.files.len() as i64 - 1) as usize;
+    }
 }
 
 /// 時刻表示。"YYYY-MM-DD HH:MM" の ISO 系文字列から "MM-DD HH:MM" を作る
@@ -121,6 +178,9 @@ pub fn deck_ui(ctx: &egui::Context, deck: &mut ColumnDeck, ui_ctx: &mut UiCtx<'_
         composer_panel(ui, ui_ctx);
     });
     reaction_picker_window(ctx, ui_ctx);
+    viewer_window(ctx, ui_ctx);
+    profile_window(ctx, ui_ctx);
+    settings_window(ctx, ui_ctx);
     egui::CentralPanel::default().show(ctx, |ui| {
         // デッキ全体の横スクロール(F-02-5)
         egui::ScrollArea::horizontal()
@@ -166,6 +226,9 @@ fn top_bar(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
                     .size(11.0)
                     .color(Color32::GRAY),
             );
+            if ui.button("⚙").on_hover_text("設定").clicked() {
+                ctx.ops.push(UiOp::OpenSettings);
+            }
         });
     });
 }
@@ -337,6 +400,228 @@ fn reaction_picker_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
     }
     if let Some(reaction) = pick {
         ctx.ops.push(UiOp::PickReaction { note_id, reaction });
+    }
+}
+
+/// 画像ビューア(F-08-1)。サムネイルクリックで開く拡大表示。
+/// ‹› ボタンと ←→ キーでめくり、×/ESC で閉じる
+fn viewer_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
+    let Some(state) = ctx.viewer.as_mut() else {
+        return;
+    };
+    if state.files.is_empty() {
+        ctx.ops.push(UiOp::CloseViewer);
+        return;
+    }
+    let mut open = true;
+    let mut step = 0i32;
+    // ←→ キーのめくりはウィンドウ表示中のみ
+    if egui_ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+        step = -1;
+    }
+    if egui_ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+        step = 1;
+    }
+    let total = state.files.len();
+    let mut reveal: Option<String> = None;
+    egui::Window::new(format!("画像 {} / {}", state.index + 1, total))
+        .collapsible(false)
+        .resizable(true)
+        .default_size([640.0, 480.0])
+        .open(&mut open)
+        .show(egui_ctx, |ui| {
+            let file = &state.files[state.index.min(total - 1)];
+            ui.horizontal(|ui| {
+                if ui.button("‹").clicked() {
+                    step = -1;
+                }
+                if ui.button("›").clicked() {
+                    step = 1;
+                }
+                ui.label(RichText::new(&file.name).size(12.0));
+                // 動画・音声と同じく外部ブラウザへの出口は残す(F-08-3)
+                if let Some(u) = &file.url
+                    && ui.link("ブラウザで開く").clicked()
+                {
+                    ctx.ops.push(UiOp::OpenUrl(u.clone()));
+                }
+            });
+            if !state.is_visible(file) {
+                // カードと同じく未開封の閲覧注意は覆ったまま(VWR-02)
+                if ui
+                    .button(
+                        RichText::new(format!("⚠ 閲覧注意: {}", file.name))
+                            .color(Color32::from_rgb(0xf0, 0xa0, 0x80)),
+                    )
+                    .clicked()
+                {
+                    reveal = Some(file.id.clone());
+                }
+            } else if let Some(u) = &file.url {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(egui::Image::new(u).fit_to_fraction(vec2(1.0, 1.0)));
+                    });
+            } else {
+                ui.label(RichText::new("(URL なし)").color(Color32::GRAY));
+            }
+        });
+    if let Some(id) = reveal {
+        ctx.ops.push(UiOp::ViewerReveal(id));
+    }
+    if !open {
+        ctx.ops.push(UiOp::CloseViewer);
+    }
+    if step != 0 {
+        ctx.ops.push(UiOp::ViewerStep(step));
+    }
+}
+
+/// プロフィール(F-05-6)。アバター/名前クリックで開く。
+/// 基本情報 + そのユーザーのノート一覧を表示する
+fn profile_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
+    let Some(state) = ctx.profile.as_mut() else {
+        return;
+    };
+    let mut open = true;
+    egui::Window::new("プロフィール")
+        .collapsible(false)
+        .resizable(true)
+        .default_size([360.0, 420.0])
+        .open(&mut open)
+        .show(egui_ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if let Some(err) = &state.error {
+                        ui.label(
+                            RichText::new(err)
+                                .size(11.0)
+                                .color(Color32::from_rgb(0xe0, 0x80, 0x80)),
+                        );
+                    }
+                    if state.user.is_none() && state.error.is_none() {
+                        ui.label(RichText::new("読み込み中…").color(Color32::GRAY));
+                    }
+                    if let Some(u) = &state.user {
+                        ui.horizontal(|ui| {
+                            if let Some(av) = &u.avatar_url {
+                                ui.add(
+                                    egui::Image::new(av)
+                                        .fit_to_exact_size(vec2(48.0, 48.0))
+                                        .corner_radius(4.0),
+                                );
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(display_name(u)).strong());
+                                ui.label(
+                                    RichText::new(format!("@{}{}", u.username, host_suffix(u)))
+                                        .size(11.0)
+                                        .color(Color32::GRAY),
+                                );
+                                if let Some(c) = &u.created_at {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "登録: {}",
+                                            c.split('T').next().unwrap_or(c)
+                                        ))
+                                        .size(10.0)
+                                        .color(Color32::GRAY),
+                                    );
+                                }
+                                if let (Some(n), Some(fi), Some(fo)) =
+                                    (u.notes_count, u.following_count, u.followers_count)
+                                {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "ノート {n} / フォロー {fi} / フォロワー {fo}"
+                                        ))
+                                        .size(10.0),
+                                    );
+                                }
+                            });
+                        });
+                        if let Some(d) = &u.description {
+                            ui.label(RichText::new(d).size(11.0));
+                        }
+                        ui.separator();
+                    }
+                    // ノート一覧(簡易カード。時刻+本文+添付数)
+                    for n in &state.notes {
+                        ui.label(
+                            RichText::new(fmt_time(&n.created_at))
+                                .size(10.0)
+                                .color(Color32::GRAY),
+                        );
+                        if let Some(t) = &n.text {
+                            ui.label(RichText::new(t).size(12.0));
+                        }
+                        if !n.files.is_empty() {
+                            ui.label(
+                                RichText::new(format!("📎 {} ファイル", n.files.len()))
+                                    .size(10.0)
+                                    .color(Color32::GRAY),
+                            );
+                        }
+                        ui.separator();
+                    }
+                    if state.loading {
+                        ui.label(RichText::new("…").color(Color32::GRAY));
+                    }
+                });
+        });
+    if !open {
+        ctx.ops.push(UiOp::CloseProfile);
+    }
+}
+
+/// @username@host 表記のホスト部分
+fn host_suffix(u: &User) -> String {
+    u.host.as_ref().map(|h| format!("@{h}")).unwrap_or_default()
+}
+
+/// 設定画面(F-09-3)。キャッシュ容量の表示と消去
+fn settings_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
+    if !*ctx.settings_win {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("設定")
+        .collapsible(false)
+        .default_size([320.0, 160.0])
+        .open(&mut open)
+        .show(egui_ctx, |ui| {
+            ui.label(RichText::new("キャッシュ").strong());
+            ui.horizontal(|ui| {
+                ui.label(format!("画像キャッシュ: {}", fmt_bytes(ctx.cache_sizes.0)));
+                if ui.button("消去").clicked() {
+                    ctx.ops.push(UiOp::ClearCache(true));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "絵文字一覧キャッシュ: {}",
+                    fmt_bytes(ctx.cache_sizes.1)
+                ));
+                if ui.button("消去").clicked() {
+                    ctx.ops.push(UiOp::ClearCache(false));
+                }
+            });
+        });
+    if !open {
+        ctx.ops.push(UiOp::CloseSettings);
+    }
+}
+
+/// バイト数の人間向け表記
+fn fmt_bytes(b: u64) -> String {
+    if b >= 1 << 20 {
+        format!("{:.1} MB", b as f64 / (1u64 << 20) as f64)
+    } else if b >= 1 << 10 {
+        format!("{:.1} KB", b as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{b} B")
     }
 }
 
@@ -801,5 +1086,59 @@ fn resize_handle(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>, _height: f3
     }
     if resp.drag_stopped() {
         *ctx.resize_base = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn df(id: &str) -> crate::model::DriveFile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": "x.png", "type": "image/png"
+        }))
+        .unwrap()
+    }
+
+    fn df_sensitive(id: &str) -> crate::model::DriveFile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": "x.png", "type": "image/png", "isSensitive": true
+        }))
+        .unwrap()
+    }
+
+    // VWR-01: ビューアのページ送りが範囲にクランプされる(F-08-1)
+    #[test]
+    fn vwr01_step_clamps() {
+        let mut v = ViewerState {
+            files: vec![df("a"), df("b"), df("c")],
+            index: 0,
+            revealed: Default::default(),
+        };
+        v.step(1);
+        assert_eq!(v.index, 1);
+        v.step(5);
+        assert_eq!(v.index, 2);
+        v.step(-10);
+        assert_eq!(v.index, 0);
+        // 空では常に 0 に戻る
+        let mut e = ViewerState::default();
+        e.step(3);
+        assert_eq!(e.index, 0);
+    }
+
+    // VWR-02: ビューア内でも未開封の閲覧注意は覆ったまま(F-08-1)
+    #[test]
+    fn vwr02_sensitive_stays_covered() {
+        let mut v = ViewerState {
+            files: vec![df("a"), df_sensitive("b")],
+            index: 0,
+            revealed: Default::default(),
+        };
+        // 非センシティブはそのまま可視、センシティブは開封済みになるまで覆う
+        assert!(v.is_visible(&v.files[0]));
+        assert!(!v.is_visible(&v.files[1]));
+        v.revealed.insert("b".to_owned());
+        assert!(v.is_visible(&v.files[1]));
     }
 }
