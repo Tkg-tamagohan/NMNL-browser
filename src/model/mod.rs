@@ -139,6 +139,10 @@ pub struct Note {
     pub mentions: Vec<String>,
     #[serde(default)]
     pub channel_id: Option<String>,
+    /// 埋め込みチャンネル情報(F-05-7)。io はチャンネル投稿に
+    /// {id,name,color,isSensitive} を同梱する。未同梱のノートは null
+    #[serde(default)]
+    pub channel: Option<NoteChannel>,
     #[serde(default)]
     pub replies_count: u32,
     #[serde(default)]
@@ -161,6 +165,63 @@ impl Note {
             && self.files.is_empty()
             && self.file_ids.is_empty()
     }
+}
+
+/// リアクションキーの解釈(F-07-4)。
+/// io のキーは `:name@.:`=ローカル絵文字、`:name@host:`=リモート絵文字、
+/// コロンで囲まれないものは Unicode 絵文字(キー自体をそのまま表示/送信する)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionKey<'a> {
+    /// Unicode 絵文字(キー自体)
+    Unicode,
+    /// ローカル絵文字(名前部分)
+    Local(&'a str),
+    /// リモート絵文字(名前, ホスト)
+    Remote(&'a str, &'a str),
+}
+
+/// `:name:`/`:name@.:`/`:name@host:` 形式のキーを分解する(F-07-4)。
+/// `:name:` 形式は io 実測上ほぼ現れないが、本家形式としてローカルに倒す
+pub fn parse_reaction_key(key: &str) -> ReactionKey<'_> {
+    let Some(inner) = key.strip_prefix(':').and_then(|s| s.strip_suffix(':')) else {
+        return ReactionKey::Unicode;
+    };
+    match inner.rsplit_once('@') {
+        Some((name, ".")) if !name.is_empty() => ReactionKey::Local(name),
+        Some((name, host)) if !name.is_empty() && !host.is_empty() => {
+            ReactionKey::Remote(name, host)
+        }
+        None if !inner.is_empty() => ReactionKey::Local(inner),
+        _ => ReactionKey::Unicode,
+    }
+}
+
+/// `reactions/create` に送る値(F-07-5)。
+/// io は `:name:`/`:name@.:` のローカル形式と Unicode 絵文字だけを受理し、
+/// `:name@host:` のリモート形式を送ると内容をハート絵文字に置き換えてしまう
+/// 実測があるため、リモート形式は None を返す(相乗りでローカル `:name@.:`
+/// に変換してから送る設計、仕様決定 O)
+pub fn reaction_send_value(key: &str) -> Option<String> {
+    match parse_reaction_key(key) {
+        ReactionKey::Unicode => Some(key.to_owned()),
+        ReactionKey::Local(name) => Some(format!(":{name}@.:")),
+        ReactionKey::Remote(..) => None,
+    }
+}
+
+/// ノートに埋め込まれるチャンネル情報(F-05-7)。
+/// `note.channel` は {id,name,color,isSensitive} の軽量オブジェクトで、
+/// channels/* 応答の `Channel` とは別型にして欠落フィールドへの耐性を持たせる
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteChannel {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub is_sensitive: bool,
 }
 
 /// `POST /api/i/notifications` の通知(F-04)
@@ -293,5 +354,61 @@ impl InstanceMeta {
     /// 機能フラグの参照。キーが無いか真偽値でなければ None
     pub fn feature(&self, name: &str) -> Option<bool> {
         self.features.get(name)?.as_bool()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "id": "n1",
+            "createdAt": "2026-10-08T00:00:00.000Z",
+            "userId": "u1",
+            "user": {"id": "u1", "username": "me"}
+        })
+    }
+
+    // CH-01: note.channel の埋め込みオブジェクト(F-05-7)。
+    // io 実測 {id,name,color,isSensitive} をデコードする
+    #[test]
+    fn ch01_note_channel_decode() {
+        let mut v = note_fixture();
+        v["channel"] = serde_json::json!({
+            "id": "ch1", "name": "開発", "color": "#88f", "isSensitive": true
+        });
+        let n: Note = serde_json::from_value(v).unwrap();
+        let ch = n.channel.expect("channel がデコードされるはず");
+        assert_eq!(ch.id, "ch1");
+        assert_eq!(ch.name.as_deref(), Some("開発"));
+        assert_eq!(ch.color.as_deref(), Some("#88f"));
+        assert!(ch.is_sensitive);
+        // 未同梱のノートは None
+        let n: Note = serde_json::from_value(note_fixture()).unwrap();
+        assert!(n.channel.is_none());
+    }
+
+    // REA-04(一部): リアクションキー形式の分解(F-07-4)。
+    // `:name@.:`=ローカル、`:name@host:`=リモート、その他は Unicode
+    #[test]
+    fn rea04_parse_reaction_key() {
+        assert_eq!(parse_reaction_key(":cat@.:"), ReactionKey::Local("cat"));
+        assert_eq!(parse_reaction_key(":cat:"), ReactionKey::Local("cat"));
+        assert_eq!(
+            parse_reaction_key(":cat@remote.tld:"),
+            ReactionKey::Remote("cat", "remote.tld")
+        );
+        assert_eq!(parse_reaction_key("❤"), ReactionKey::Unicode);
+    }
+
+    // REA-08: reactions/create に送る値(F-07-5)。ローカル形式は `:name@.:`
+    // に正規化、Unicode はそのまま、リモート形式は送れない
+    #[test]
+    fn rea08_reaction_send_value() {
+        assert_eq!(reaction_send_value(":cat@.:").as_deref(), Some(":cat@.:"));
+        assert_eq!(reaction_send_value(":cat:").as_deref(), Some(":cat@.:"));
+        assert_eq!(reaction_send_value("❤").as_deref(), Some("❤"));
+        assert!(reaction_send_value(":cat@remote.tld:").is_none());
     }
 }

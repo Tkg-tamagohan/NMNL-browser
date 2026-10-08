@@ -500,11 +500,15 @@ impl NmnlApp {
         });
     }
 
-    /// リアクション付与/取消(F-07)
+    /// リアクション付与/取消(F-07)。
+    /// `send` は付与時に reactions/create へ送る値(F-07-5 の正規化済み形式)、
+    /// `affect` は結果イベントでローカルカウントを動かすキー。
+    /// 相乗り(リモート絵文字→ローカル :name@.:)では両者が異なる
     fn spawn_reaction(
         &mut self,
         note_id: String,
-        reaction: String,
+        send: String,
+        affect: String,
         add: bool,
         ctx: &egui::Context,
     ) {
@@ -515,14 +519,14 @@ impl NmnlApp {
         let ctx2 = ctx.clone();
         self.runtime.spawn(async move {
             let result = if add {
-                client.create_reaction(&note_id, &reaction).await
+                client.create_reaction(&note_id, &send).await
             } else {
                 client.delete_reaction(&note_id).await
             }
             .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::ReactionResult {
                 note_id,
-                reaction,
+                reaction: affect,
                 add,
                 result,
             });
@@ -1013,15 +1017,33 @@ impl NmnlApp {
             }
             UiOp::PickReaction { note_id, reaction } => {
                 self.reaction_picker = None;
-                self.spawn_reaction(note_id, reaction, true, ctx);
+                // F-07-5: create に送れる形式(:name:/:name@.:/Unicode)に正規化
+                if let Some(v) = crate::model::reaction_send_value(&reaction) {
+                    let affect = v.clone();
+                    self.spawn_reaction(note_id, v, affect, true, ctx);
+                }
             }
             UiOp::ToggleReaction {
                 note_id,
                 reaction,
+                send,
                 mine,
             } => {
-                // 自分のリアクションは取り消し、それ以外は同じ絵文字で付与
-                self.spawn_reaction(note_id, reaction, !mine, ctx);
+                // 自分のリアクションは取り消し、それ以外は同じ絵文字で付与。
+                // send は UI 側で F-07-5 形式へ正規化済み(相乗りは :name@.:)
+                if mine {
+                    self.spawn_reaction(note_id, String::new(), reaction, false, ctx);
+                } else if let Some(v) = send {
+                    self.spawn_reaction(note_id, v, reaction, true, ctx);
+                }
+            }
+            UiOp::OpenChannel { channel_id } => {
+                // 仕様決定 Q: 既存の channel カラムがあれば対象を差し替える
+                let (id, need_fetch) = self.deck.open_channel_column(&channel_id);
+                self.sync_subscriptions(ctx);
+                if need_fetch {
+                    self.spawn_fetch(id, FetchKind::Initial, ctx);
+                }
             }
             // Phase 8: ビューア・プロフィール・設定
             UiOp::OpenViewer {

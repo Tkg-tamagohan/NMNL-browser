@@ -66,11 +66,19 @@ pub enum UiOp {
         note_id: String,
         reaction: String,
     },
-    /// バッジクリックのトグル(自分のは取り消し、それ以外は付与)
+    /// バッジクリックのトグル(自分のは取り消し、それ以外は付与)。
+    /// `reaction` はローカルカウントを動かすキー、`send` は付与時に
+    /// reactions/create へ送る値(取消では None で何も送らない)
     ToggleReaction {
         note_id: String,
         reaction: String,
+        send: Option<String>,
         mine: bool,
+    },
+    /// チャンネル名クリックでそのチャンネルの channel カラムを開く
+    /// (F-05-7・仕様決定 Q)。既存の channel カラムがあれば対象を差し替える
+    OpenChannel {
+        channel_id: String,
     },
     // Phase 8: ビューア・プロフィール・設定
     /// 画像ビューアを開く(F-08-1)。files はそのノートの画像全件、index は開始位置
@@ -846,13 +854,20 @@ fn timeline_body(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add_space(4.0);
+            // 仕様決定 R: 当該チャンネルの channel カラム内では
+            // カードのチャンネル名行を省略する
+            let hide_channel = if matches!(col.spec.kind, crate::config::ColumnKind::Channel) {
+                col.spec.channel_id.as_deref()
+            } else {
+                None
+            };
             match &col.items {
                 ColumnItems::Notes(notes) => {
                     for note in notes.iter() {
                         ui.horizontal(|ui| {
                             ui.add_space(4.0);
                             ui.vertical(|ui| {
-                                card::note_card(ui, note, ctx, id);
+                                card::note_card(ui, note, ctx, id, hide_channel);
                             });
                         });
                     }
@@ -915,6 +930,12 @@ fn timeline_body(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
 /// 会話ビュー(F-05-5)。選択ノートを中心に notes/conversation を表示する
 fn conversation_body(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
     let id = col.id;
+    // 仕様決定 R: 当該チャンネルの channel カラム内ではチャンネル名行を省略
+    let hide_channel = if matches!(col.spec.kind, crate::config::ColumnKind::Channel) {
+        col.spec.channel_id.clone()
+    } else {
+        None
+    };
     if ui.button("← 戻る").clicked() {
         ctx.ops.push(UiOp::CloseConversation(id));
         return;
@@ -954,7 +975,7 @@ fn conversation_body(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
                     Color32::from_rgb(0x22, 0x24, 0x2a)
                 };
                 Frame::default().fill(bg).corner_radius(4.0).show(ui, |ui| {
-                    card::note_card(ui, note, ctx, id);
+                    card::note_card(ui, note, ctx, id, hide_channel.as_deref());
                 });
             }
         });

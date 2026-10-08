@@ -790,6 +790,23 @@ impl ColumnDeck {
         }
     }
 
+    /// チャンネル名クリックで channel カラムを開く(F-05-7・仕様決定 Q)。
+    /// 既存の channel カラムがあれば先頭のものの対象を差し替え、
+    /// 無ければ末尾に追加する。戻り値は (カラム ID, 内容取得が必要か)
+    pub fn open_channel_column(&mut self, channel_id: &str) -> (u64, bool) {
+        let id = self
+            .columns
+            .iter()
+            .find(|c| c.spec.kind == ColumnKind::Channel)
+            .map(|c| c.id)
+            .unwrap_or_else(|| self.add(AddableKind::Channel));
+        let need_fetch = self.columns.iter().find(|c| c.id == id).is_some_and(|c| {
+            c.spec.channel_id.as_deref() != Some(channel_id) || c.items.is_empty()
+        });
+        self.set_channel(id, Some(channel_id.to_owned()));
+        (id, need_fetch)
+    }
+
     /// 通知フィルタ変更(F-04-1)。サーバー側 excludeTypes にも使うので
     /// 内容クリアして REST から取り直す(フィルタ緩和で過去分を拾うため)
     pub fn set_ntf_filter(&mut self, id: u64, filter: NotificationFilter) {
@@ -1320,5 +1337,43 @@ mod tests {
         deck.move_delta(ids[0], 1);
         assert_eq!(kind_at(&deck, 1), ColumnKind::Timeline);
         assert_eq!(kind_at(&deck, 0), ColumnKind::Notifications);
+    }
+
+    // CH-03: チャンネル名クリックで channel カラムを開く(F-05-7・決定 Q)。
+    // 無ければ末尾に追加、既存があれば先頭のカラムの対象を差し替える
+    #[test]
+    fn ch03_open_channel_column() {
+        // channel カラムが無いときは新規追加して取得対象にする
+        let mut deck = ColumnDeck::from_specs(vec![ColumnSpec {
+            kind: ColumnKind::Timeline,
+            ..Default::default()
+        }]);
+        let (id, need) = deck.open_channel_column("ch1");
+        let col = deck.columns.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(col.spec.kind, ColumnKind::Channel);
+        assert_eq!(col.spec.channel_id.as_deref(), Some("ch1"));
+        assert!(need);
+
+        // 既存の channel カラムがあるときは対象を差し替える
+        let (id2, need2) = deck.open_channel_column("ch2");
+        assert_eq!(id2, id);
+        assert_eq!(
+            deck.columns[col_index(&deck, id2)]
+                .spec
+                .channel_id
+                .as_deref(),
+            Some("ch2")
+        );
+        assert!(need2);
+        // 同じチャンネルを再度開くときは差し替え不要(取得も不要)
+        let idx = col_index(&deck, id2);
+        deck.columns[idx].push_note(note("a1"));
+        let (id3, need3) = deck.open_channel_column("ch2");
+        assert_eq!(id3, id2);
+        assert!(!need3);
+    }
+
+    fn col_index(deck: &ColumnDeck, id: u64) -> usize {
+        deck.columns.iter().position(|c| c.id == id).unwrap()
     }
 }
