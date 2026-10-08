@@ -132,6 +132,9 @@ enum AppEvent {
         result: Result<Box<Note>, String>,
         /// アップロード結果を反映した添付(失敗時にフォームへ戻す)
         files: Vec<PendingFile>,
+        /// フォーム発の投稿か。false(リノート等)ならフォーム状態は
+        /// 触らず通知だけにする(下書きの添付・本文を消さない)
+        from_composer: bool,
     },
     /// リアクション付与/取消の結果(F-07)
     ReactionResult {
@@ -388,12 +391,22 @@ impl NmnlApp {
     }
 
     /// 投稿/返信/引用/リノートの送信(F-06)。添付は先に drive へ
-    /// アップロードして fileIds に乗せてから notes/create を呼ぶ
-    fn spawn_post(&mut self, mut req: CreateNote, files: Vec<PendingFile>, ctx: &egui::Context) {
+    /// アップロードして fileIds に乗せてから notes/create を呼ぶ。
+    /// `from_composer` が true のときだけフォームを送信中にし、
+    /// 結果で添付を復元する(リノート等のフォーム外投稿は触らない)
+    fn spawn_post(
+        &mut self,
+        mut req: CreateNote,
+        files: Vec<PendingFile>,
+        from_composer: bool,
+        ctx: &egui::Context,
+    ) {
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.composer.posting = true;
+        if from_composer {
+            self.composer.posting = true;
+        }
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.runtime.spawn(async move {
@@ -409,7 +422,11 @@ impl NmnlApp {
                         .map_err(|e| e.to_string())
                 }
             };
-            let _ = tx.send(AppEvent::PostResult { result, files });
+            let _ = tx.send(AppEvent::PostResult {
+                result,
+                files,
+                from_composer,
+            });
             ctx2.request_repaint();
         });
     }
@@ -883,7 +900,7 @@ impl NmnlApp {
                         // 添付が消えて再投稿で抜け落ちるのを防ぐ
                         // (Arc<Vec<u8>> なので clone は浅い)
                         let files = self.composer.files.clone();
-                        self.spawn_post(req, files, ctx);
+                        self.spawn_post(req, files, true, ctx);
                     }
                     Err(e) => {
                         self.composer.error = Some(e);
@@ -901,7 +918,7 @@ impl NmnlApp {
                     renote_id: Some(note_id),
                     ..Default::default()
                 };
-                self.spawn_post(req, Vec::new(), ctx);
+                self.spawn_post(req, Vec::new(), false, ctx);
             }
             UiOp::OpenReactionPicker(note_id) => {
                 self.reaction_picker = Some(ReactionPickerState {
@@ -1154,7 +1171,20 @@ impl NmnlApp {
             AppEvent::EmojiResult { name, url } => {
                 self.emoji_cache.complete(&name, url);
             }
-            AppEvent::PostResult { result, files } => {
+            AppEvent::PostResult {
+                result,
+                files,
+                from_composer,
+            } => {
+                if !from_composer {
+                    // リノート等のフォーム外投稿: フォームの下書きは
+                    // そのままに、通知だけ更新する
+                    self.notice = Some(match result {
+                        Ok(note) => format!("投稿しました({})", note.id),
+                        Err(e) => format!("投稿に失敗: {e}"),
+                    });
+                    return;
+                }
                 self.composer.posting = false;
                 match result {
                     Ok(note) => {

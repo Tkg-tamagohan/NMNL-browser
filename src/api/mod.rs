@@ -1327,4 +1327,59 @@ mod tests {
         assert_eq!(files[1].uploaded_id.as_deref(), Some("d-new"));
         m.assert_async().await;
     }
+
+    // DRV-03: 2 件目のアップロードが失敗したとき、成功した 1 件目の
+    // uploaded_id が files に残る(リトライで再送しないための前提)
+    #[tokio::test]
+    async fn drv03_partial_failure_keeps_uploaded_id() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        // a.png だけ成功、b.png は 500
+        let ok = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/drive/files/create")
+                    .body_includes("filename=\"a.png\"");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "d1", "name": "a.png", "type": "image/png"
+                    }));
+            })
+            .await;
+        let ng = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/drive/files/create")
+                    .body_includes("filename=\"b.png\"");
+                then.status(500)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "error": {"code": "E", "message": "ng"}
+                    }));
+            })
+            .await;
+        let client =
+            ApiClient::for_test(format!("{}/api", server.base_url()), Some("tok".to_owned()));
+        let mut files = vec![
+            crate::composer::PendingFile {
+                name: "a.png".to_owned(),
+                mime: "image/png".to_owned(),
+                data: std::sync::Arc::new(vec![1u8]),
+                uploaded_id: None,
+            },
+            crate::composer::PendingFile {
+                name: "b.png".to_owned(),
+                mime: "image/png".to_owned(),
+                data: std::sync::Arc::new(vec![2u8]),
+                uploaded_id: None,
+            },
+        ];
+        assert!(client.upload_pending_files(&mut files).await.is_err());
+        // 成功分の ID は残るので、戻したフォームからの再送は b.png のみ
+        assert_eq!(files[0].uploaded_id.as_deref(), Some("d1"));
+        assert!(files[1].uploaded_id.is_none());
+        ok.assert_async().await;
+        ng.assert_async().await;
+    }
 }
