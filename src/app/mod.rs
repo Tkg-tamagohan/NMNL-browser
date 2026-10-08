@@ -873,8 +873,12 @@ impl NmnlApp {
                             true
                         }
                         None => {
-                            col.backfill_since = None;
-                            col.backfill_until = None;
+                            // 停止中バッファ溢れで歩き切れていない区間が
+                            // 残る場合は起点を保持する(解除時に続きを取る)
+                            if !col.pending_overflow {
+                                col.backfill_since = None;
+                                col.backfill_until = None;
+                            }
                             false
                         }
                     }
@@ -1035,6 +1039,9 @@ async fn fetch_backfill_impl(
     let mut notifs: Vec<Notification> = Vec::new();
     let mut merged_oldest: Option<String> = None;
     let mut merged_newest: Option<String> = None;
+    // 境界(または空ページ)に到達したら true。上限で打ち切ったときだけ
+    // 続き位置を返すため、最終到達を別途記録する
+    let mut done = false;
     for _ in 0..BACKFILL_MAX_PAGES {
         let result = fetch_page_impl(client, spec, &cur, ntf_excludes).await?;
         // ページ末尾(最古側)の ID。次ページの untilId と境界判定に使う
@@ -1078,6 +1085,7 @@ async fn fetch_backfill_impl(
             Some(o) => o.as_str() <= since.as_str(),
         };
         if reached {
+            done = true;
             break;
         }
         cur.until_id = page_oldest;
@@ -1091,8 +1099,9 @@ async fn fetch_backfill_impl(
             newest_id: merged_newest,
         }),
     };
-    // 上限ページ数で終わった場合は続き位置を返し、呼び側が再開する
-    Ok((merged, cur.until_id))
+    // 上限ページ数で終わった場合だけ続き位置を返し、呼び側が再開する。
+    // 境界に達した(または空ページで尽きた)なら None で完走とする
+    Ok((merged, if done { None } else { cur.until_id }))
 }
 
 impl eframe::App for NmnlApp {

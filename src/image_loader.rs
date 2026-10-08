@@ -117,11 +117,13 @@ impl CachedImageLoader {
             // リダイレクトは手動で追い、ホップごとにスキームと宛先を再検証。
             // DNS 解決は接続時に独自リゾルバが行うので、検証と接続の間の
             // 再解決差し替え(TOCTOU/DNS rebinding)も塞がれる(N-02)
+            // 構築が失敗しても無検査のクライアントには落とさない
+            // (リゾルバ無しのフォールバックは宛先検査を素通りさせる)
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .expect("画像クライアントの構築に失敗"),
         }
     }
 

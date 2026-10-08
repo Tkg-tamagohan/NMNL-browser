@@ -267,16 +267,17 @@ impl Column {
             self.seen_ids.insert(note.id);
             return false;
         }
-        self.seen_ids.insert(note.id.clone());
         if self.paused {
-            if self.pending_notes.len() < PENDING_CAP {
-                self.pending_notes.push_back(note);
-            } else {
-                // 保留が溢れた分は捨てるが、解除時に REST 補充で拾う印を立てる
+            if self.pending_notes.len() >= PENDING_CAP {
+                // seen に入れずに捨て、解除時の REST 補充で拾えるようにする
                 self.pending_overflow = true;
+                return false;
             }
+            self.seen_ids.insert(note.id.clone());
+            self.pending_notes.push_back(note);
             return false;
         }
+        self.seen_ids.insert(note.id.clone());
         self.insert_note_sorted(note);
         true
     }
@@ -356,18 +357,20 @@ impl Column {
         raw_newest: Option<String>,
     ) {
         for note in notes {
-            if !self.seen_ids.insert(note.id.clone()) {
+            if self.seen_ids.contains(&note.id) {
                 continue;
             }
             if !api::note_allowed(&note, &self.spec.filters) {
+                self.seen_ids.insert(note.id);
                 continue;
             }
+            if self.paused && self.pending_notes.len() >= PENDING_CAP {
+                self.pending_overflow = true;
+                continue;
+            }
+            self.seen_ids.insert(note.id.clone());
             if self.paused {
-                if self.pending_notes.len() < PENDING_CAP {
-                    self.pending_notes.push_back(note);
-                } else {
-                    self.pending_overflow = true;
-                }
+                self.pending_notes.push_back(note);
                 continue;
             }
             self.insert_note_sorted(note);
@@ -409,18 +412,20 @@ impl Column {
         raw_newest: Option<String>,
     ) {
         for n in notifs {
-            if !self.seen_ids.insert(n.id.clone()) {
+            if self.seen_ids.contains(&n.id) {
                 continue;
             }
             if !self.ntf_filter.allows(&n.kind) {
+                self.seen_ids.insert(n.id);
                 continue;
             }
+            if self.paused && self.pending_notifs.len() >= PENDING_CAP {
+                self.pending_overflow = true;
+                continue;
+            }
+            self.seen_ids.insert(n.id.clone());
             if self.paused {
-                if self.pending_notifs.len() < PENDING_CAP {
-                    self.pending_notifs.push_back(n);
-                } else {
-                    self.pending_overflow = true;
-                }
+                self.pending_notifs.push_back(n);
                 continue;
             }
             self.bump_cursors(None, None);
@@ -440,15 +445,16 @@ impl Column {
             self.seen_ids.insert(n.id);
             return false;
         }
-        self.seen_ids.insert(n.id.clone());
         if self.paused {
-            if self.pending_notifs.len() < PENDING_CAP {
-                self.pending_notifs.push_back(n);
-            } else {
+            if self.pending_notifs.len() >= PENDING_CAP {
                 self.pending_overflow = true;
+                return false;
             }
+            self.seen_ids.insert(n.id.clone());
+            self.pending_notifs.push_back(n);
             return false;
         }
+        self.seen_ids.insert(n.id.clone());
         self.bump_cursors(Some(&n.id), Some(&n.id));
         if let ColumnItems::Notifications(items) = &mut self.items {
             let pos = items.partition_point(|existing| existing.id > n.id);
@@ -470,6 +476,16 @@ impl Column {
     /// (捨てた側は保留先頭より新しい区間なので、その ID から補充する)
     pub fn set_paused(&mut self, paused: bool) {
         if self.paused && !paused {
+            // 溢れで捨てた区間の下端(=残した最古 ID)はドレイン前に採る
+            let oldest_kept = if self.pending_overflow {
+                self.pending_notes
+                    .iter()
+                    .map(|n| n.id.clone())
+                    .chain(self.pending_notifs.iter().map(|n| n.id.clone()))
+                    .min()
+            } else {
+                None
+            };
             while let Some(n) = self.pending_notes.pop_front() {
                 self.insert_note_sorted(n);
             }
@@ -481,7 +497,13 @@ impl Column {
             }
             if self.pending_overflow {
                 self.pending_overflow = false;
-                if self.backfill_since.is_none() {
+                if self.backfill_since.is_some() {
+                    // 補充の途中で溢れた: 歩き切れていない区間を
+                    // until→since で解除後に取り切る
+                    self.backfill_until = oldest_kept;
+                } else {
+                    // ストリーミング分だけの溢れ: 捨てた分は合成結果の
+                    // 最前端より新しい区間なので、その ID を起点に補充する
                     self.backfill_since = self.newest_id.clone();
                 }
             }
@@ -1101,5 +1123,24 @@ mod tests {
         // 保留先頭(=直近の新着)以降の欠落を拾うためその ID が起点になる
         assert_eq!(col.backfill_since, col.newest_id);
         assert_eq!(col.backfill_since.as_deref(), Some("n0499"));
+    }
+
+    /// COL-18: 補充の途中で保留が溢れた場合、歩き切れていない区間を
+    /// until→since で解除後に取り切る(捨てた分は seen に残さない)
+    #[test]
+    fn col18_paused_backfill_overflow_resumes_gap() {
+        let mut col = tl_column();
+        col.backfill_since = Some("n0000".to_owned());
+        col.set_paused(true);
+        // 補充が n0600..n0001 を降順で流す(600 件 > 保留上限 500)
+        let notes: Vec<Note> = (1..=600).rev().map(|i| note(&format!("n{i:04}"))).collect();
+        col.append_backfill(notes, Some("n0001".to_owned()), Some("n0600".to_owned()));
+        assert!(col.pending_overflow);
+        col.set_paused(false);
+        assert_eq!(col.backfill_since.as_deref(), Some("n0000"));
+        // 残した最古 ID が続き位置になる(n0100 以下が落ちた区間)
+        assert_eq!(col.backfill_until.as_deref(), Some("n0101"));
+        // 捨てた分は seen に入っていないので補充で拾い直せる
+        assert!(col.push_note(note("n0050")));
     }
 }
