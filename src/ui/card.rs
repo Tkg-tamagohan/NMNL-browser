@@ -85,11 +85,23 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
     let card_rect = inner.response.rect;
     // クリック = カード内で押下を開始し、カード内でリリース。
     // primary_clicked は egui のクリック閾値(max_click_dist)考慮済みで
-    // ドラッグは弾かれる。press_origin はリリース時点で None にクリア
-    // されるので、押下中のフレームで事前記録して照合する
+    // ドラッグは弾かれる。押下位置は press_origin(押下中フレーム)と
+    // 同一フレームの PointerButton イベント(押下・リリースが同フレームに
+    // 来るケース)の両方から記録する
     ui.ctx().input(|i| {
-        if i.pointer.primary_down() {
-            ctx.card_state.press_pos = i.pointer.press_origin();
+        if let Some(p) = i.pointer.press_origin() {
+            ctx.card_state.press_pos = Some(p);
+        }
+        for ev in &i.events {
+            if let egui::Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                pos,
+                pressed: true,
+                ..
+            } = ev
+            {
+                ctx.card_state.press_pos = Some(*pos);
+            }
         }
     });
     let released = ui.ctx().input(|i| {
