@@ -26,6 +26,7 @@ jobs:
             libdbus-1-dev libxdo-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: python3 scripts/check_test_ids.py
 
   build:
     strategy:
