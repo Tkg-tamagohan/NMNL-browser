@@ -23,8 +23,10 @@ pub struct EmojiCache {
     resolved: HashMap<String, Option<String>>,
     /// 取得を投げた名前一覧(重複リクエスト防止)
     in_flight: HashSet<String>,
-    /// 一時失敗で再試行を待つ名前と(再試行可能時刻, 失敗回数)
-    retry_after: HashMap<String, (Instant, u8)>,
+    /// 一時失敗で再試行を待つ名前と再試行可能時刻
+    retry_after: HashMap<String, Instant>,
+    /// 一時失敗の累計回数(クールダウン経過でリセットしない)
+    fails: HashMap<String, u8>,
 }
 
 impl EmojiCache {
@@ -44,10 +46,11 @@ impl EmojiCache {
         if let Some(url) = self.resolved.get(name) {
             return url.clone();
         }
-        if let Some(&(at, _)) = self.retry_after.get(name) {
+        if let Some(&at) = self.retry_after.get(name) {
             if Instant::now() < at {
                 return None;
             }
+            // 期限経過で再要求可能にする。失敗回数は fails に残す
             self.retry_after.remove(name);
         }
         self.in_flight.insert(name.to_owned());
@@ -57,13 +60,15 @@ impl EmojiCache {
     /// 一時的な失敗(429、通信障害など)を記録し、クールダウン後に再試行する。
     /// 上限回数を超えたら不在扱いにして打ち切る
     pub fn fail_transient(&mut self, name: &str) {
-        let attempts = self.retry_after.get(name).map(|&(_, n)| n).unwrap_or(0) + 1;
+        let attempts = self.fails.get(name).copied().unwrap_or(0) + 1;
         if attempts >= MAX_TRANSIENT_ATTEMPTS {
+            self.fails.remove(name);
             self.retry_after.remove(name);
             self.resolved.insert(name.to_owned(), None);
         } else {
+            self.fails.insert(name.to_owned(), attempts);
             self.retry_after
-                .insert(name.to_owned(), (Instant::now() + RETRY_COOLDOWN, attempts));
+                .insert(name.to_owned(), Instant::now() + RETRY_COOLDOWN);
         }
     }
 
@@ -75,6 +80,8 @@ impl EmojiCache {
     /// 取得完了を記録する(404 は Some(None))
     pub fn complete(&mut self, name: &str, url: Option<String>) {
         self.resolved.insert(name.to_owned(), url);
+        self.fails.remove(name);
+        self.retry_after.remove(name);
     }
 }
 
@@ -149,7 +156,7 @@ mod tests {
         assert!(c.drain_pending().is_empty());
         // クールダウン経過: 再要求される(否定キャッシュにならない)
         c.retry_after
-            .insert("a".to_owned(), (Instant::now() - Duration::from_secs(1), 1));
+            .insert("a".to_owned(), Instant::now() - Duration::from_secs(1));
         assert!(c.resolve("a").is_none());
         assert_eq!(c.drain_pending(), vec!["a".to_owned()]);
     }
@@ -164,12 +171,21 @@ mod tests {
     }
 
     // EMO-03: 一時失敗が上限回数に達したら不在扱いに倒す(io は存在しない名にも
-    // INTERNAL_ERROR を返すので、無限再試行しない)
+    // INTERNAL_ERROR を返すので、無限再試行しない)。回数はクールダウン経過の
+    // 再要求をまたいで累計される(resolve→失敗のサイクルで上限に達すること)
     #[test]
     fn emo03_transient_gives_up_after_cap() {
         let mut c = EmojiCache::default();
         for _ in 0..MAX_TRANSIENT_ATTEMPTS {
+            // resolve で要求 → 取得失敗のライフサイクルを回す
+            assert!(c.resolve("a").is_none());
+            let _ = c.drain_pending();
             c.fail_transient("a");
+            // クールダウンを経過させる(上限到達でエントリが消えた後は触らない)
+            if c.retry_after.contains_key("a") {
+                c.retry_after
+                    .insert("a".to_owned(), Instant::now() - Duration::from_secs(60));
+            }
         }
         // 否定キャッシュに倒れて再要求されない
         assert!(c.resolve("a").is_none());
