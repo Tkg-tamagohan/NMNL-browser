@@ -21,6 +21,9 @@ pub struct CardState {
     /// カード内部クリックの会話遷移(F-05-5)で、これらの領域への
     /// クリックは子に委ねるための除外ゾーン
     pub click_exclusions: Vec<egui::Rect>,
+    /// 押下位置の保持。press_origin はリリースフレームで None に
+    /// クリアされるため、押下中の各フレームで記録しておく
+    pub press_pos: Option<egui::Pos2>,
 }
 
 /// 表示対象のメディア分類。F-08-3 の外部ブラウザ起動対象かどうかの判定に使う
@@ -80,15 +83,24 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
     }
     .unwrap_or_else(|| note.id.clone());
     let card_rect = inner.response.rect;
-    // クリック = カード内でリリース。primary_clicked は egui の
-    // クリック閾値(max_click_dist)考慮済みなのでドラッグは弾かれる。
-    // press_origin はリリース時点で None にクリアされるため連言に使えない
+    // クリック = カード内で押下を開始し、カード内でリリース。
+    // primary_clicked は egui のクリック閾値(max_click_dist)考慮済みで
+    // ドラッグは弾かれる。press_origin はリリース時点で None にクリア
+    // されるので、押下中のフレームで事前記録して照合する
+    ui.ctx().input(|i| {
+        if i.pointer.primary_down() {
+            ctx.card_state.press_pos = i.pointer.press_origin();
+        }
+    });
     let released = ui.ctx().input(|i| {
         i.pointer.primary_clicked()
             && i.pointer
                 .latest_pos()
                 .is_some_and(|p| card_rect.contains(p))
-    });
+    }) && ctx
+        .card_state
+        .press_pos
+        .is_some_and(|p| card_rect.contains(p));
     if released {
         let pos = ui.ctx().pointer_latest_pos().unwrap_or_default();
         if !ctx
