@@ -159,44 +159,47 @@ fn header(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
     let frame = Frame::default()
         .fill(Color32::from_rgb(0x26, 0x28, 0x30))
         .inner_margin(egui::Margin::symmetric(8, 6));
-    ui.dnd_drag_source(egui::Id::new(("col_drag", id)), id, |ui| {
-        frame.show(ui, |ui| {
-            ui.horizontal(|ui| {
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            // ドラッグ起点は ≡ ハンドルのみに限定する。ヘッダ全体を
+            // drag_source にすると全領域の interact が子ボタンより
+            // 後に登録され、hit test でクリックが奪われる(egui 0.32)
+            ui.dnd_drag_source(egui::Id::new(("col_drag", id)), id, |ui| {
                 ui.label(RichText::new("≡").color(Color32::GRAY));
-                ui.label(RichText::new(col.title()).strong());
-                if col.pending_count() > 0 {
-                    ui.label(
-                        RichText::new(format!("+{}", col.pending_count()))
-                            .size(10.0)
-                            .color(Color32::from_rgb(0xf0, 0xc0, 0x60)),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("×").on_hover_text("削除").clicked() {
-                        ctx.ops.push(UiOp::Remove(id));
-                    }
-                    let pause_label = if col.paused { "▶" } else { "⏸" };
-                    if ui
-                        .button(pause_label)
-                        .on_hover_text(if col.paused { "再開" } else { "一時停止" })
-                        .clicked()
-                    {
-                        ctx.ops.push(UiOp::SetPaused(id, !col.paused));
-                    }
-                    if ui.button("⚙").on_hover_text("設定").clicked() {
-                        *ctx.settings_open = if *ctx.settings_open == Some(id) {
-                            None
-                        } else {
-                            Some(id)
-                        };
-                    }
-                });
             });
-            if *ctx.settings_open == Some(id) {
-                ui.separator();
-                settings_panel(ui, col, ctx);
+            ui.label(RichText::new(col.title()).strong());
+            if col.pending_count() > 0 {
+                ui.label(
+                    RichText::new(format!("+{}", col.pending_count()))
+                        .size(10.0)
+                        .color(Color32::from_rgb(0xf0, 0xc0, 0x60)),
+                );
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("×").on_hover_text("削除").clicked() {
+                    ctx.ops.push(UiOp::Remove(id));
+                }
+                let pause_label = if col.paused { "▶" } else { "⏸" };
+                if ui
+                    .button(pause_label)
+                    .on_hover_text(if col.paused { "再開" } else { "一時停止" })
+                    .clicked()
+                {
+                    ctx.ops.push(UiOp::SetPaused(id, !col.paused));
+                }
+                if ui.button("⚙").on_hover_text("設定").clicked() {
+                    *ctx.settings_open = if *ctx.settings_open == Some(id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                }
+            });
         });
+        if *ctx.settings_open == Some(id) {
+            ui.separator();
+            settings_panel(ui, col, ctx);
+        }
     });
     ui.separator();
 }

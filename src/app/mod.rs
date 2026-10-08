@@ -878,8 +878,17 @@ impl NmnlApp {
                             if !col.pending_overflow {
                                 col.backfill_since = None;
                                 col.backfill_until = None;
+                                // 別区間の欠落が控えていればそちらに進む
+                                if let Some((s, u)) = col.extra_backfill.take() {
+                                    col.backfill_since = s;
+                                    col.backfill_until = u;
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
                             }
-                            false
                         }
                     }
                 } else {

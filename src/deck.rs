@@ -166,6 +166,9 @@ pub struct Column {
     pub backfill_since: Option<String>,
     /// 複数ページ補充の途中位置。上限で止まったらここから続きを取る
     pub backfill_until: Option<String>,
+    /// もう一方の欠落区間(since, until)。停止中に補充と新着の両方向で
+    /// 溢れたとき、メインの補充とは別区間として取り切るために控える
+    pub extra_backfill: Option<(Option<String>, Option<String>)>,
     /// 一時停止バッファが溢れて新着を捨てた。解除時に REST 補充する印
     pub pending_overflow: bool,
     /// invalidate ごとに増える世代番号。飛行中の REST 結果を破棄する印
@@ -208,6 +211,7 @@ impl Column {
             seen_ids: SeenIds::new(),
             backfill_since: None,
             backfill_until: None,
+            extra_backfill: None,
             pending_overflow: false,
             fetch_gen: 0,
             newest_id: None,
@@ -501,6 +505,11 @@ impl Column {
                     // 補充の途中で溢れた: 歩き切れていない区間を
                     // until→since で解除後に取り切る
                     self.backfill_until = oldest_kept;
+                    // 補充と同時に届いた新着分が溢れた場合、残した最新側
+                    // より新しい区間も欠落しているので別区間として控える
+                    if let Some(newest) = self.newest_id.clone() {
+                        self.extra_backfill = Some((Some(newest), None));
+                    }
                 } else {
                     // ストリーミング分だけの溢れ: 捨てた分は合成結果の
                     // 最前端より新しい区間なので、その ID を起点に補充する
@@ -544,6 +553,7 @@ impl Column {
         self.view = ColumnView::default();
         self.backfill_since = None;
         self.backfill_until = None;
+        self.extra_backfill = None;
         self.pending_overflow = false;
         self.fetch_gen += 1;
         self.dirty = true;
@@ -1140,7 +1150,34 @@ mod tests {
         assert_eq!(col.backfill_since.as_deref(), Some("n0000"));
         // 残した最古 ID が続き位置になる(n0100 以下が落ちた区間)
         assert_eq!(col.backfill_until.as_deref(), Some("n0101"));
+        // 残した最新側より新しい欠落の控えも立つ(この例では新着なし)
+        assert_eq!(col.extra_backfill, Some((Some("n0600".to_owned()), None)));
         // 捨てた分は seen に入っていないので補充で拾い直せる
         assert!(col.push_note(note("n0050")));
+    }
+
+    /// COL-19: 停止中に補充と新着が同時に溢れたら、古い側は until→since、
+    /// 新しい側は別区間の sinceId で両方取り切る状態を作る
+    #[test]
+    fn col19_both_directions_refilled() {
+        let mut col = tl_column();
+        col.backfill_since = Some("n0000".to_owned());
+        col.set_paused(true);
+        // 補充がバッファを埋める(n0600..n0101)
+        let notes: Vec<Note> = (101..=600)
+            .rev()
+            .map(|i| note(&format!("n{i:04}")))
+            .collect();
+        col.append_backfill(notes, Some("n0101".to_owned()), Some("n0600".to_owned()));
+        // そのあと届いた新着は溢れで捨てられる
+        assert!(!col.push_note(note("n0700")));
+        col.set_paused(false);
+        // 古い側: 残した最古から切断境界まで
+        assert_eq!(col.backfill_until.as_deref(), Some("n0101"));
+        assert_eq!(col.backfill_since.as_deref(), Some("n0000"));
+        // 新しい側: 残した最新から先(落ちた n0700 を拾う区間)
+        assert_eq!(col.extra_backfill, Some((Some("n0600".to_owned()), None)));
+        // 落ちた新着は seen に残っていないので拾い直せる
+        assert!(col.push_note(note("n0700")));
     }
 }

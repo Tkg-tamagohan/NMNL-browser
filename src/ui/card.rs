@@ -47,26 +47,33 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
         .stroke(Stroke::new(1.0f32, Color32::from_rgb(0x32, 0x34, 0x3c)))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(8, 6));
-    let inner = frame
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if note.is_pure_renote()
-                && let Some(target) = &note.renote
-            {
-                // 純粋リノート: バナー行 + リノート元の内容をそのまま表示
-                ui.label(
-                    RichText::new(format!("🔁 {} がリノート", display_name(&note.user)))
-                        .color(Color32::from_rgb(0x9e, 0xd0, 0x8e))
-                        .size(11.0),
-                );
-                body(ui, target, ctx, col_id, true);
-            } else {
-                body(ui, note, ctx, col_id, false);
-            }
-        })
-        .response;
+    // カード本体クリックの判定は子描画の「前」に登録する。egui の
+    // hit test は同一センスの重なりを後に登録した widget が勝つため、
+    // 描画後に全領域 interact すると子ボタン(CW/閲覧注意/↗等)が潰れる。
+    // 先に登録しておけば子が自分の領域を上書きし、余白クリックのみカード判定になる
+    let card_resp = ui.interact(
+        ui.available_rect_before_wrap(),
+        egui::Id::new(("note_card", col_id, &note.id)),
+        Sense::click(),
+    );
+    frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if note.is_pure_renote()
+            && let Some(target) = &note.renote
+        {
+            // 純粋リノート: バナー行 + リノート元の内容をそのまま表示
+            ui.label(
+                RichText::new(format!("🔁 {} がリノート", display_name(&note.user)))
+                    .color(Color32::from_rgb(0x9e, 0xd0, 0x8e))
+                    .size(11.0),
+            );
+            body(ui, target, ctx, col_id, true);
+        } else {
+            body(ui, note, ctx, col_id, false);
+        }
+    });
     // カード本体クリックで会話ビュー(F-05-5)。ボタン類の応答とは重ならない領域
-    if inner.interact(Sense::click()).clicked() {
+    if card_resp.clicked() {
         ctx.ops
             .push(UiOp::OpenConversation(col_id, note.id.clone()));
     }
