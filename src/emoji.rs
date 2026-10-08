@@ -61,17 +61,18 @@ impl EmojiCache {
     }
 
     /// 一時的な失敗(429、通信障害など)を記録し、クールダウン後に再試行する。
-    /// 短い間隔での再試行が上限に達したら長い間隔に移行する(恒久否定はしない)。
-    /// 返り値は次の再試行までの待ち時間
+    /// 短い間隔での再試行が上限に達したら長い間隔に移行し、以後の失敗も
+    /// 長い間隔を選び続ける(恒久否定はしない)。返り値は次の再試行までの待ち時間
     pub fn fail_transient(&mut self, name: &str) -> Duration {
-        let attempts = self.fails.get(name).copied().unwrap_or(0) + 1;
+        let attempts = self.fails.get(name).copied().unwrap_or(0).saturating_add(1);
         let cooldown = if attempts >= MAX_TRANSIENT_ATTEMPTS {
-            self.fails.remove(name);
             RETRY_COOLDOWN_LONG
         } else {
-            self.fails.insert(name.to_owned(), attempts);
             RETRY_COOLDOWN
         };
+        // 回数は上限で頭打ちにして保持(以後の失敗も長い間隔を選ばせる)
+        self.fails
+            .insert(name.to_owned(), attempts.min(MAX_TRANSIENT_ATTEMPTS));
         self.retry_after
             .insert(name.to_owned(), Instant::now() + cooldown);
         cooldown
@@ -197,5 +198,7 @@ mod tests {
             .insert("a".to_owned(), Instant::now() - Duration::from_secs(1));
         assert!(c.resolve("a").is_none());
         assert_eq!(c.drain_pending(), vec!["a".to_owned()]);
+        // その後の失敗も長い間隔を選び続ける(短い間隔に戻らない)
+        assert_eq!(c.fail_transient("a"), RETRY_COOLDOWN_LONG);
     }
 }
