@@ -5,10 +5,11 @@
 //! 取得/ページング/欠落補充/購読管理をここで集約する(F-03-5/6)。
 
 use crate::api::{self, ApiClient, MiauthStatus, Paging, TimelinePage};
+use crate::composer::{Composer, PendingFile};
 use crate::config::{self, AppConfig, ColumnKind, ColumnSpec};
 use crate::deck::{AddableKind, ColumnDeck, ColumnView};
-use crate::emoji::EmojiCache;
-use crate::model::{Channel, Note, Notification, User};
+use crate::emoji::{self, EmojiCache};
+use crate::model::{Channel, CreateNote, Emoji, Note, Notification, User};
 use crate::streaming::{self, StreamChannel, StreamEvent, StreamHandle};
 use crate::ui::{self, CardState, UiCtx, UiOp};
 use eframe::egui;
@@ -126,6 +127,24 @@ enum AppEvent {
     },
     /// 絵文字のオンデマンド解決結果(F-05-2)
     EmojiResult { name: String, url: Option<String> },
+    /// 投稿/返信/引用/リノートの結果(F-06)
+    PostResult {
+        result: Result<Box<Note>, String>,
+        /// アップロード結果を反映した添付(失敗時にフォームへ戻す)
+        files: Vec<PendingFile>,
+        /// フォーム発の投稿か。false(リノート等)ならフォーム状態は
+        /// 触らず通知だけにする(下書きの添付・本文を消さない)
+        from_composer: bool,
+    },
+    /// リアクション付与/取消の結果(F-07)
+    ReactionResult {
+        note_id: String,
+        reaction: String,
+        add: bool,
+        result: Result<(), String>,
+    },
+    /// ピッカー用絵文字一覧の取得結果(F-07-3)
+    EmojiListResult { result: Result<Vec<Emoji>, String> },
     /// ストリーミング層からの転送イベント
     Stream(StreamEvent),
 }
@@ -165,6 +184,23 @@ pub struct NmnlApp {
     picker_open: Option<u64>,
     resize_base: Option<(u64, f32)>,
     add_kind: AddableKind,
+    // Phase 7: 投稿と操作
+    /// 投稿フォーム(F-06)
+    composer: Composer,
+    /// ピッカー用の絵文字一覧(F-07-3)。起動時にディスクキャッシュから
+    /// 先読みし、認証後に最新を取って上書きする
+    emoji_list: Vec<Emoji>,
+    /// リアクションピッカーの対象ノート(F-07-2)
+    reaction_picker: Option<ReactionPickerState>,
+    /// 操作結果の一行通知(投稿成功・失敗など)
+    notice: Option<String>,
+}
+
+/// リアクションピッカーの開閉状態(検索クエリを保持)
+#[derive(Debug, Default)]
+pub struct ReactionPickerState {
+    pub note_id: String,
+    pub query: String,
 }
 
 impl NmnlApp {
@@ -206,6 +242,11 @@ impl NmnlApp {
             picker_open: None,
             resize_base: None,
             add_kind: AddableKind::Timeline(config::TimelineKind::Home),
+            composer: Composer::default(),
+            // F-07-3: 前回取得した一覧があれば即表示できるよう先読みする
+            emoji_list: emoji::load_emoji_list(),
+            reaction_picker: None,
+            notice: None,
         };
 
         match config::token::resolve_token(config::HOST) {
@@ -345,6 +386,93 @@ impl NmnlApp {
         for id in ids {
             self.spawn_fetch(id, FetchKind::Initial, ctx);
         }
+        // 絵文字一覧の最新化(F-07-3)
+        self.spawn_emoji_list(ctx);
+    }
+
+    /// 投稿/返信/引用/リノートの送信(F-06)。添付は先に drive へ
+    /// アップロードして fileIds に乗せてから notes/create を呼ぶ。
+    /// `from_composer` が true のときだけフォームを送信中にし、
+    /// 結果で添付を復元する(リノート等のフォーム外投稿は触らない)
+    fn spawn_post(
+        &mut self,
+        mut req: CreateNote,
+        files: Vec<PendingFile>,
+        from_composer: bool,
+        ctx: &egui::Context,
+    ) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        if from_composer {
+            self.composer.posting = true;
+        }
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let mut files = files;
+            let result = match client.upload_pending_files(&mut files).await {
+                Err(e) => Err(format!("添付のアップロード失敗: {e}")),
+                Ok(ids) => {
+                    req.file_ids = ids;
+                    client
+                        .create_note(&req)
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string())
+                }
+            };
+            let _ = tx.send(AppEvent::PostResult {
+                result,
+                files,
+                from_composer,
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// リアクション付与/取消(F-07)
+    fn spawn_reaction(
+        &mut self,
+        note_id: String,
+        reaction: String,
+        add: bool,
+        ctx: &egui::Context,
+    ) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let result = if add {
+                client.create_reaction(&note_id, &reaction).await
+            } else {
+                client.delete_reaction(&note_id).await
+            }
+            .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ReactionResult {
+                note_id,
+                reaction,
+                add,
+                result,
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// ピッカー用の絵文字一覧を取る(F-07-3)
+    fn spawn_emoji_list(&self, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let result = client.emojis().await.map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::EmojiListResult { result });
+            ctx2.request_repaint();
+        });
     }
 
     /// カラム構成と購読を同期する(F-02-1 の追加/削除・F-03-7 のチャンネル変更)
@@ -742,6 +870,77 @@ impl NmnlApp {
             UiOp::OpenUrl(u) => {
                 let _ = open::that(&u);
             }
+            // Phase 7: 投稿と操作
+            UiOp::ReplyTo { id, label } => {
+                // 返信と引用は相互排他(本文中に両方参照は作れない)
+                self.composer.quote_of = None;
+                self.composer.reply_to = Some(crate::composer::PostTarget { id, label });
+            }
+            UiOp::Quote { id, label } => {
+                self.composer.reply_to = None;
+                self.composer.quote_of = Some(crate::composer::PostTarget { id, label });
+            }
+            UiOp::ClearTarget(reply) => {
+                if reply {
+                    self.composer.reply_to = None;
+                } else {
+                    self.composer.quote_of = None;
+                }
+            }
+            UiOp::PostNote => {
+                let me_id = match &self.auth {
+                    AuthState::Authenticated { user } => Some(user.id.clone()),
+                    _ => None,
+                };
+                match self.composer.build_request(me_id.as_deref()) {
+                    Ok(req) => {
+                        self.composer.error = None;
+                        self.notice = None;
+                        // ファイルは clone で渡してフォームに残す。投稿失敗時に
+                        // 添付が消えて再投稿で抜け落ちるのを防ぐ
+                        // (Arc<Vec<u8>> なので clone は浅い)
+                        let files = self.composer.files.clone();
+                        self.spawn_post(req, files, true, ctx);
+                    }
+                    Err(e) => {
+                        self.composer.error = Some(e);
+                    }
+                }
+            }
+            UiOp::RemoveAttachment(i) => {
+                if i < self.composer.files.len() {
+                    self.composer.files.remove(i);
+                }
+            }
+            UiOp::Renote(note_id) => {
+                // リノートはフォームを通さず即時投稿(仕様決定 E)
+                let req = CreateNote {
+                    renote_id: Some(note_id),
+                    ..Default::default()
+                };
+                self.spawn_post(req, Vec::new(), false, ctx);
+            }
+            UiOp::OpenReactionPicker(note_id) => {
+                self.reaction_picker = Some(ReactionPickerState {
+                    note_id,
+                    query: String::new(),
+                });
+            }
+            UiOp::CloseReactionPicker => {
+                self.reaction_picker = None;
+            }
+            UiOp::PickReaction { note_id, reaction } => {
+                self.reaction_picker = None;
+                self.spawn_reaction(note_id, reaction, true, ctx);
+            }
+            UiOp::ToggleReaction {
+                note_id,
+                reaction,
+                mine,
+            } => {
+                // 自分のリアクションは取り消し、それ以外は同じ絵文字で付与
+                self.spawn_reaction(note_id, reaction, !mine, ctx);
+            }
         }
     }
 
@@ -972,6 +1171,59 @@ impl NmnlApp {
             AppEvent::EmojiResult { name, url } => {
                 self.emoji_cache.complete(&name, url);
             }
+            AppEvent::PostResult {
+                result,
+                files,
+                from_composer,
+            } => {
+                if !from_composer {
+                    // リノート等のフォーム外投稿: フォームの下書きは
+                    // そのままに、通知だけ更新する
+                    self.notice = Some(match result {
+                        Ok(note) => format!("投稿しました({})", note.id),
+                        Err(e) => format!("投稿に失敗: {e}"),
+                    });
+                    return;
+                }
+                self.composer.posting = false;
+                match result {
+                    Ok(note) => {
+                        // 投稿成功: フォームをリセット。タイムラインへの
+                        // 反映はストリーミング/補充に委ねる
+                        self.composer.clear();
+                        self.notice = Some(format!("投稿しました({})", note.id));
+                    }
+                    Err(e) => {
+                        // アップロード済み ID 入りの添付をフォームへ戻す。
+                        // リトライで同じファイルを再アップロードしないため
+                        self.composer.files = files;
+                        self.composer.error = Some(format!("投稿に失敗: {e}"));
+                        self.notice = None;
+                    }
+                }
+            }
+            AppEvent::ReactionResult {
+                note_id,
+                reaction,
+                add,
+                result,
+            } => match result {
+                Ok(()) => {
+                    // 成功したら表示中のノートへローカル反映(F-07)
+                    for col in &mut self.deck.columns {
+                        col.apply_reaction(&note_id, &reaction, add);
+                    }
+                }
+                Err(e) => {
+                    self.notice = Some(format!("リアクション失敗: {e}"));
+                }
+            },
+            AppEvent::EmojiListResult { result } => {
+                if let Ok(list) = result {
+                    emoji::save_emoji_list(&list);
+                    self.emoji_list = list;
+                }
+            }
         }
     }
 }
@@ -1149,6 +1401,10 @@ impl eframe::App for NmnlApp {
                     add_kind: &mut self.add_kind,
                     stream_status: &self.stream_status,
                     me,
+                    composer: &mut self.composer,
+                    emoji_list: &self.emoji_list,
+                    reaction_picker: &mut self.reaction_picker,
+                    notice: &mut self.notice,
                 };
                 ui::deck_ui(ctx, &mut self.deck, &mut ui_ctx);
             }

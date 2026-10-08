@@ -295,32 +295,55 @@ fn body(
         });
     }
 
-    // 操作行(F-06/E)。投稿系は Phase 7 の範囲のため、現段階では
-    // 外部ブラウザで開くリンクのみ有効にしておく
+    // 操作行(F-06/E・仕様決定 E)。行内の全ボタンは click_exclusions に
+    // 矩形登録しないと、カード内クリック判定が OpenConversation を
+    // 二重発火させる
     ui.horizontal(|ui| {
         let url = note.url.clone().or_else(|| note.uri.clone());
-        if ui
-            .button(RichText::new("💬").size(12.0))
-            .on_hover_text("会話を表示")
-            .clicked()
-        {
+        let btn = |label: &str, tip: &str, ui: &mut Ui, ctx: &mut UiCtx<'_>| {
+            let resp = ui
+                .button(RichText::new(label).size(12.0))
+                .on_hover_text(tip);
+            ctx.card_state.click_exclusions.push(resp.rect);
+            resp
+        };
+        if btn("💬", "会話を表示", ui, ctx).clicked() {
             ctx.ops
                 .push(UiOp::OpenConversation(col_id, conv_id.to_owned()));
         }
         if let Some(u) = url
-            && ui
-                .button(RichText::new("↗").size(12.0))
-                .on_hover_text("ブラウザで開く")
-                .clicked()
+            && btn("↗", "ブラウザで開く", ui, ctx).clicked()
         {
             ctx.ops.push(UiOp::OpenUrl(u));
         }
-        ui.label(
-            RichText::new("↩ 🔁 ❝ 😀 ⋯")
-                .size(11.0)
-                .color(Color32::DARK_GRAY),
-        )
-        .on_hover_text("投稿系の操作は Phase 7 で実装予定");
+        // ↩/❝ はフォームに対象をセット、🔁 は即時リノート、😀 はピッカー
+        let label = format!(
+            "@{}{}",
+            note.user.username,
+            note.user
+                .host
+                .as_deref()
+                .map(|h| format!("@{h}"))
+                .unwrap_or_default()
+        );
+        if btn("↩", "返信", ui, ctx).clicked() {
+            ctx.ops.push(UiOp::ReplyTo {
+                id: note.id.clone(),
+                label: label.clone(),
+            });
+        }
+        if btn("🔁", "リノート", ui, ctx).clicked() {
+            ctx.ops.push(UiOp::Renote(note.id.clone()));
+        }
+        if btn("❝", "引用", ui, ctx).clicked() {
+            ctx.ops.push(UiOp::Quote {
+                id: note.id.clone(),
+                label,
+            });
+        }
+        if btn("😀", "リアクション", ui, ctx).clicked() {
+            ctx.ops.push(UiOp::OpenReactionPicker(note.id.clone()));
+        }
     });
 }
 
@@ -463,7 +486,9 @@ fn reaction_badge(ui: &mut Ui, name: &str, count: u32, note: &Note, ctx: &mut Ui
     let count_text = RichText::new(count.to_string())
         .size(11.0)
         .color(Color32::LIGHT_GRAY);
-    if let Some(emoji_name) = name.strip_prefix(':').and_then(|s| s.strip_suffix(':')) {
+    // バッジクリックでトグル(F-07): 自分のは取り消し、それ以外は付与。
+    // 除外矩形に登録しないとカード内クリック判定が会話を開いてしまう
+    let resp = if let Some(emoji_name) = name.strip_prefix(':').and_then(|s| s.strip_suffix(':')) {
         // :name: 形式はカスタム絵文字。reaction_emojis → note.emojis → キャッシュの順
         let url = note
             .reaction_emojis
@@ -472,30 +497,34 @@ fn reaction_badge(ui: &mut Ui, name: &str, count: u32, note: &Note, ctx: &mut Ui
             .cloned()
             .or_else(|| ctx.emoji_cache.resolve(emoji_name));
         match url {
-            Some(u) => {
-                ui.add(
-                    egui::Button::image_and_text(
-                        egui::Image::new(u).fit_to_exact_size(vec2(14.0, 14.0)),
-                        count_text,
-                    )
+            Some(u) => ui.add(
+                egui::Button::image_and_text(
+                    egui::Image::new(u).fit_to_exact_size(vec2(14.0, 14.0)),
+                    count_text,
+                )
+                .fill(bg)
+                .stroke(stroke),
+            ),
+            None => ui.add(
+                egui::Button::new(RichText::new(format!(":{emoji_name}: {count}")).size(11.0))
                     .fill(bg)
                     .stroke(stroke),
-                );
-            }
-            None => {
-                ui.add(
-                    egui::Button::new(RichText::new(format!(":{emoji_name}: {count}")).size(11.0))
-                        .fill(bg)
-                        .stroke(stroke),
-                );
-            }
+            ),
         }
     } else {
         ui.add(
             egui::Button::new(RichText::new(format!("{name} {count}")).size(11.0))
                 .fill(bg)
                 .stroke(stroke),
-        );
+        )
+    };
+    ctx.card_state.click_exclusions.push(resp.rect);
+    if resp.clicked() {
+        ctx.ops.push(UiOp::ToggleReaction {
+            note_id: note.id.clone(),
+            reaction: name.to_owned(),
+            mine,
+        });
     }
 }
 

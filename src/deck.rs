@@ -564,6 +564,53 @@ impl Column {
         self.fetch_gen += 1;
         self.dirty = true;
     }
+
+    /// リアクション付与/取消のローカル反映(F-07)。
+    /// add=true なら絵文字の個数を加算して my_reaction に記録、false なら
+    /// 減算して my_reaction を外す。TL・一時停止バッファ・会話ビューの
+    /// すべてを探し、純粋リノートの内側も対象にする(サーバー応答を
+    /// 待たず UI へ即時反映するための近似)
+    pub fn apply_reaction(&mut self, note_id: &str, reaction: &str, add: bool) {
+        fn touch(n: &mut Note, note_id: &str, reaction: &str, add: bool) -> bool {
+            if n.id == note_id {
+                if add {
+                    *n.reactions.entry(reaction.to_owned()).or_insert(0) += 1;
+                    n.my_reaction = Some(reaction.to_owned());
+                } else {
+                    if let Some(c) = n.reactions.get_mut(reaction) {
+                        *c = c.saturating_sub(1);
+                        if *c == 0 {
+                            n.reactions.remove(reaction);
+                        }
+                    }
+                    n.my_reaction = None;
+                }
+                return true;
+            }
+            if let Some(r) = n.renote.as_deref_mut()
+                && touch(r, note_id, reaction, add)
+            {
+                return true;
+            }
+            if let Some(r) = n.reply.as_deref_mut() {
+                return touch(r, note_id, reaction, add);
+            }
+            false
+        }
+        if let ColumnItems::Notes(notes) = &mut self.items {
+            for n in notes.iter_mut() {
+                touch(n, note_id, reaction, add);
+            }
+        }
+        for n in self.pending_notes.iter_mut() {
+            touch(n, note_id, reaction, add);
+        }
+        if let ColumnView::Conversation { notes, .. } = &mut self.view {
+            for n in notes.iter_mut() {
+                touch(n, note_id, reaction, add);
+            }
+        }
+    }
 }
 
 pub fn timeline_label(kind: TimelineKind) -> &'static str {

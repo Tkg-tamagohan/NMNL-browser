@@ -50,3 +50,45 @@ impl EmojiCache {
         self.resolved.insert(name.to_owned(), url);
     }
 }
+
+/// ピッカー用絵文字一覧のディスクキャッシュ(F-07-3)。
+/// メタ情報(名前/カテゴリ/URL)のみなので量は小さいが、異常に大きい
+/// 応答からディスクを守るため上限を設ける
+const EMOJI_LIST_CACHE_CAP: u64 = 8 * 1024 * 1024;
+
+fn emoji_list_path() -> std::path::PathBuf {
+    directories::BaseDirs::new()
+        .map(|d| d.cache_dir().join("nmnl-browser").join("emoji_list.json"))
+        .unwrap_or_else(|| std::env::temp_dir().join("nmnl-browser-emoji_list.json"))
+}
+
+/// 起動時に一覧を先読みする(F-07-3 のキャッシュ)。上限超過や
+/// 壊れたファイルは無視して空を返す
+pub fn load_emoji_list() -> Vec<crate::model::Emoji> {
+    let path = emoji_list_path();
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Vec::new();
+    };
+    if meta.len() > EMOJI_LIST_CACHE_CAP {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// 取得した一覧をディスクに書く(F-07-3)。上限超過なら書かない
+pub fn save_emoji_list(list: &[crate::model::Emoji]) {
+    let Ok(text) = serde_json::to_string(list) else {
+        return;
+    };
+    if text.len() as u64 > EMOJI_LIST_CACHE_CAP {
+        return;
+    }
+    let path = emoji_list_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, text);
+}

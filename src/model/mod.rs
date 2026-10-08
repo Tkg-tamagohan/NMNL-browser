@@ -227,6 +227,38 @@ pub struct EmojisResponse {
     pub emojis: Vec<Emoji>,
 }
 
+/// `POST /api/notes/create` のリクエスト(F-06)。
+/// `i` は Client が自動で差すのでここには書かない
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNote {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cw: Option<String>,
+    pub visibility: Visibility,
+    /// ダイレクト投稿の宛先ユーザー一覧(visibility=specified のとき必須)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub visible_user_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renote_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_only: bool,
+}
+
+/// `POST /api/notes/create` の応答ラッパー
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedNote {
+    pub created_note: Note,
+}
+
 /// `POST /api/meta` のインスタンス情報。N-05 の機能差検出に使う
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

@@ -39,6 +39,39 @@ pub enum UiOp {
     ChannelPickerOpen(u64),
     /// 外部ブラウザで開く(F-08-3 など)
     OpenUrl(String),
+    // Phase 7: 投稿と操作(F-06/F-07)
+    /// 返信対象のセット(投稿フォームへ。引用と相互排他)
+    ReplyTo {
+        id: String,
+        label: String,
+    },
+    /// 引用対象のセット
+    Quote {
+        id: String,
+        label: String,
+    },
+    /// 対象の解除(true=返信、false=引用)
+    ClearTarget(bool),
+    /// フォームから投稿
+    PostNote,
+    /// 添付の取り外し(インデックス)
+    RemoveAttachment(usize),
+    /// 即時リノート(F-06)
+    Renote(String),
+    /// リアクションピッカーの開閉(F-07-2)
+    OpenReactionPicker(String),
+    CloseReactionPicker,
+    /// ピッカーで選んだリアクションを付与
+    PickReaction {
+        note_id: String,
+        reaction: String,
+    },
+    /// バッジクリックのトグル(自分のは取り消し、それ以外は付与)
+    ToggleReaction {
+        note_id: String,
+        reaction: String,
+        mine: bool,
+    },
 }
 
 /// 描画に必要なアプリ状態の参照まとめ
@@ -58,6 +91,14 @@ pub struct UiCtx<'a> {
     pub stream_status: &'a str,
     /// ログイン中のユーザー(メインカラム表示用)
     pub me: Option<&'a User>,
+    /// 投稿フォーム(F-06)
+    pub composer: &'a mut crate::composer::Composer,
+    /// ピッカー用絵文字一覧(F-07-3)
+    pub emoji_list: &'a [crate::model::Emoji],
+    /// リアクションピッカーの開閉状態(F-07-2)
+    pub reaction_picker: &'a mut Option<crate::app::ReactionPickerState>,
+    /// 一行通知(投稿成功など)
+    pub notice: &'a mut Option<String>,
 }
 
 /// 時刻表示。"YYYY-MM-DD HH:MM" の ISO 系文字列から "MM-DD HH:MM" を作る
@@ -76,6 +117,10 @@ pub fn deck_ui(ctx: &egui::Context, deck: &mut ColumnDeck, ui_ctx: &mut UiCtx<'_
     egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
         top_bar(ui, ui_ctx);
     });
+    egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
+        composer_panel(ui, ui_ctx);
+    });
+    reaction_picker_window(ctx, ui_ctx);
     egui::CentralPanel::default().show(ctx, |ui| {
         // デッキ全体の横スクロール(F-02-5)
         egui::ScrollArea::horizontal()
@@ -123,6 +168,176 @@ fn top_bar(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
             );
         });
     });
+}
+
+/// 投稿フォーム(F-06)。常設のボトムパネルで、返信/引用は対象を
+/// セットして同じフォームから投稿する
+fn composer_panel(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
+    use crate::composer::{MAX_ATTACHMENTS, visibility_label};
+    // 投稿中は編集を不可にする。成功時にフォーム全体をリセットするため、
+    // 送信中の追記がリクエストに含まれないまま消えるのを防ぐ
+    ui.add_enabled_ui(!ctx.composer.posting, |ui| {
+        ui.horizontal(|ui| {
+            // 返信/引用の対象表示と解除(F-06-3)
+            let mut clear_reply = false;
+            let mut clear_quote = false;
+            if let Some(t) = &ctx.composer.reply_to {
+                ui.label(RichText::new(format!("↩ {} への返信", t.label)).size(11.0));
+                if ui.small_button("×").clicked() {
+                    clear_reply = true;
+                }
+            }
+            if let Some(t) = &ctx.composer.quote_of {
+                ui.label(RichText::new(format!("❝ {} の引用", t.label)).size(11.0));
+                if ui.small_button("×").clicked() {
+                    clear_quote = true;
+                }
+            }
+            if clear_reply {
+                ctx.ops.push(UiOp::ClearTarget(true));
+            }
+            if clear_quote {
+                ctx.ops.push(UiOp::ClearTarget(false));
+            }
+            // CW 切り替え
+            let mut cw_on = ctx.composer.cw_enabled;
+            if ui.checkbox(&mut cw_on, "CW").changed() {
+                ctx.composer.cw_enabled = cw_on;
+            }
+            // 公開範囲(F-06-1)
+            egui::ComboBox::from_id_salt("visibility")
+                .selected_text(visibility_label(ctx.composer.visibility))
+                .show_ui(ui, |ui| {
+                    for v in [
+                        crate::model::Visibility::Public,
+                        crate::model::Visibility::Home,
+                        crate::model::Visibility::Followers,
+                        crate::model::Visibility::Specified,
+                    ] {
+                        ui.selectable_value(&mut ctx.composer.visibility, v, visibility_label(v));
+                    }
+                });
+            // 添付(D&D、最大 MAX_ATTACHMENTS)
+            ui.label(
+                RichText::new("画像をドロップで添付")
+                    .size(10.0)
+                    .color(Color32::GRAY),
+            );
+            let mut remove_at = None;
+            for (i, f) in ctx.composer.files.iter().enumerate() {
+                ui.label(RichText::new(&f.name).size(10.0));
+                if ui.small_button("×").clicked() {
+                    remove_at = Some(i);
+                }
+            }
+            if let Some(i) = remove_at {
+                ctx.ops.push(UiOp::RemoveAttachment(i));
+            }
+            ui.label(
+                RichText::new(format!("{}/{MAX_ATTACHMENTS}", ctx.composer.files.len()))
+                    .size(10.0)
+                    .color(Color32::GRAY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_post = !ctx.composer.posting;
+                if ui
+                    .add_enabled(can_post, egui::Button::new("投稿"))
+                    .clicked()
+                {
+                    ctx.ops.push(UiOp::PostNote);
+                }
+            });
+        });
+        if ctx.composer.cw_enabled {
+            ui.add(
+                egui::TextEdit::singleline(&mut ctx.composer.cw)
+                    .hint_text("注釈(CW)")
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        ui.add(
+            egui::TextEdit::multiline(&mut ctx.composer.text)
+                .hint_text("いまどうしてる?")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        // エラーと通知
+        if let Some(e) = &ctx.composer.error {
+            ui.label(
+                RichText::new(e)
+                    .size(10.0)
+                    .color(Color32::from_rgb(0xe0, 0x80, 0x80)),
+            );
+        }
+        if let Some(n) = ctx.notice.as_ref() {
+            ui.label(
+                RichText::new(n)
+                    .size(10.0)
+                    .color(Color32::from_rgb(0x9e, 0xd0, 0x8e)),
+            );
+        }
+        // ドロップ検知(領域全体)
+        let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            if let Some(bytes) = f.bytes {
+                let path = f.path.clone().unwrap_or_else(|| f.name.clone().into());
+                ctx.composer.push_dropped(&path, bytes.to_vec());
+            } else if let Some(path) = f.path {
+                if let Ok(data) = std::fs::read(&path) {
+                    ctx.composer.push_dropped(&path, data);
+                } else {
+                    ctx.composer.error = Some(format!("読めないファイル: {}", path.display()));
+                }
+            }
+        }
+    });
+}
+
+/// リアクションピッカー(F-07-2)。検索欄+絵文字グリッドの浮遊ウィンドウ
+fn reaction_picker_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
+    let Some(state) = ctx.reaction_picker.as_mut() else {
+        return;
+    };
+    let note_id = state.note_id.clone();
+    let mut open = true;
+    let mut pick = None;
+    egui::Window::new("リアクションを選択")
+        .collapsible(false)
+        .resizable(true)
+        .default_size([280.0, 320.0])
+        .open(&mut open)
+        .show(egui_ctx, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("検索(name/aliases)"));
+            ui.separator();
+            // クエリは TextEdit が state.query を更新した後に読む
+            // (先にコピーすると絞り込みが 1 フレーム遅れる)
+            let q = state.query.trim().to_lowercase();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for e in ctx.emoji_list.iter().filter(|e| {
+                            q.is_empty()
+                                || e.name.to_lowercase().contains(&q)
+                                || e.aliases.iter().any(|a| a.to_lowercase().contains(&q))
+                        }) {
+                            let btn = egui::Button::new(
+                                egui::RichText::new(format!(":{}:", e.name)).size(12.0),
+                            )
+                            .min_size(egui::vec2(0.0, 22.0));
+                            if ui.add(btn).on_hover_text(&e.name).clicked() {
+                                pick = Some(format!(":{}:", e.name));
+                            }
+                        }
+                    });
+                });
+        });
+    if !open {
+        ctx.ops.push(UiOp::CloseReactionPicker);
+    }
+    if let Some(reaction) = pick {
+        ctx.ops.push(UiOp::PickReaction { note_id, reaction });
+    }
 }
 
 /// 並べ替えドロップゾーン(F-02-2)。細い帯で、ドラッグ中にハイライトされる
