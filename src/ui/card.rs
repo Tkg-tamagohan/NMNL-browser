@@ -373,7 +373,8 @@ fn media_row(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, _col_id: u64) {
         return;
     }
     let avail = ui.available_width();
-    let thumb_w = ((avail - 4.0) / 2.0).clamp(120.0, avail);
+    // サムネイルはカラム幅いっぱい(実機フィードバックで半幅だと小さすぎた)
+    let thumb_w = (avail - 4.0).clamp(120.0, avail);
     // ビューア用にノート内の画像一覧を先に集める(F-08-1)
     let images: Vec<DriveFile> = note
         .files

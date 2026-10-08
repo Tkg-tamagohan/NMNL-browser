@@ -49,6 +49,8 @@ pub struct ChannelPicker {
     pub loading: bool,
     /// 読み込み済みフラグ(フォロー中一覧は初回オープン時に一度だけ取得)
     pub followed_loaded: bool,
+    /// ピッカー内で出す取得エラー(カラム本体のエラーとは別にする)
+    pub error: Option<String>,
 }
 
 /// 通知カラムの種別フィルタ(F-04-1)。オフの種別を集合で保持し、
