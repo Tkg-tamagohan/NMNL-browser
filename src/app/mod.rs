@@ -100,6 +100,8 @@ enum AppEvent {
     FetchResult {
         col_id: u64,
         kind: FetchKind,
+        /// 発行時点のカラム世代。invalidate 前の飛行結果を破棄する照合に使う
+        fetch_gen: u64,
         result: Result<FetchResult, String>,
     },
     /// 会話ビュー(F-05-5): 選択ノート自身 + 会話チェーン
@@ -116,6 +118,8 @@ enum AppEvent {
     /// チャンネル検索結果(F-03-7)
     ChannelSearchResult {
         col_id: u64,
+        /// 発行時のクエリ(古いクエリの応答で上書きしない照合に使う)
+        query: String,
         result: Result<Vec<Channel>, String>,
     },
     /// 絵文字のオンデマンド解決結果(F-05-2)
@@ -144,7 +148,10 @@ pub struct NmnlApp {
     /// 多重化 WS のハンドル。 None = 未接続
     stream: Option<StreamHandle>,
     /// 購読中のチャンネル→sub_id(subscribe の ack で確定)
+    /// ack 済みの購読(チャンネル→sub_id)
     subs: HashMap<StreamChannel, String>,
+    /// 発行済みだが ack 未着の購読(ack 待ちの間に再同期しても重複発行しない)
+    pending_subs: std::collections::HashSet<StreamChannel>,
     /// ストリーミング接続の表示用文字列
     stream_status: String,
     /// 認証後に初期取得を流したか(認証遷移の一度きりガード)
@@ -188,6 +195,7 @@ impl NmnlApp {
             client: None,
             stream: None,
             subs: HashMap::new(),
+            pending_subs: std::collections::HashSet::new(),
             stream_status: "未接続".to_owned(),
             bootstrapped_stream: false,
             emoji_cache: EmojiCache::default(),
@@ -362,11 +370,12 @@ impl NmnlApp {
                 stream.unsubscribe(&sub_id);
             }
         }
-        // 新しい分を張る
+        // 新しい分を張る(ack 待ちの重複発行を pending で防ぐ)
         for ch in desired {
-            if self.subs.contains_key(&ch) {
+            if self.subs.contains_key(&ch) || self.pending_subs.contains(&ch) {
                 continue;
             }
+            self.pending_subs.insert(ch.clone());
             let rx = stream.subscribe(ch.clone());
             let tx = self.tx.clone();
             let ch_clone = ch.clone();
@@ -420,7 +429,11 @@ impl NmnlApp {
                 }
             }
             FetchKind::Backfill => {
-                let Some(since) = col.newest_id.clone() else {
+                // 切断時点で保存した最新 ID を起点にする。
+                // 復帰直後の新着が先に届いて newest_id が進んでも、
+                // 切断中の区間を取り逃さないように切り離した起点を使う
+                let Some(since) = col.backfill_since.take().or_else(|| col.newest_id.clone())
+                else {
                     // 未取得なら初回取得に倒す
                     return self.spawn_fetch(col_id, FetchKind::Initial, ctx);
                 };
@@ -433,14 +446,20 @@ impl NmnlApp {
         };
         let spec = col.spec.clone();
         let ntf_excludes = col.ntf_filter.exclude_types();
+        let fetch_gen = col.fetch_gen;
         col.fetching = true;
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.runtime.spawn(async move {
-            let result = fetch_page_impl(&client, &spec, &paging, &ntf_excludes).await;
+            let result = if kind == FetchKind::Backfill {
+                fetch_backfill_impl(&client, &spec, paging, &ntf_excludes).await
+            } else {
+                fetch_page_impl(&client, &spec, &paging, &ntf_excludes).await
+            };
             let _ = tx.send(AppEvent::FetchResult {
                 col_id,
                 kind,
+                fetch_gen,
                 result,
             });
             ctx2.request_repaint();
@@ -501,7 +520,11 @@ impl NmnlApp {
                 .search_channels(&query, 20, 0)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::ChannelSearchResult { col_id, result });
+            let _ = tx.send(AppEvent::ChannelSearchResult {
+                col_id,
+                query,
+                result,
+            });
             ctx2.request_repaint();
         });
     }
@@ -538,6 +561,12 @@ impl NmnlApp {
                     "切断(再接続 {attempt} 回目、{:.0} 秒後)",
                     retry_in.as_secs_f32()
                 );
+                // 欠落補充の起点を切断時点の最新 ID で固定する。
+                // 復帰後に新着が先に届いて newest_id が進んでも、
+                // 切断中の区間の sinceId はこちらを使う
+                for col in &mut self.deck.columns {
+                    col.backfill_since = col.newest_id.clone();
+                }
             }
             StreamEvent::Subscribed { .. } => {
                 // 購読 ack は sub_id のみ。チャンネルは AppEvent::Subscribed で別経路で届く
@@ -622,12 +651,15 @@ impl NmnlApp {
                 self.spawn_fetch(id, FetchKind::Initial, ctx);
             }
             UiOp::FetchNextPage(id) => {
+                // 初回判定は items ではなくカーソルで見る。
+                // フィルタで初回ページが全件落ちてもカーソルは進むので
+                // 次は Next(untilId 続き)で歩く必要がある
                 let kind = if self
                     .deck
                     .columns
                     .iter()
                     .find(|c| c.id == id)
-                    .is_some_and(|c| c.items.is_empty())
+                    .is_some_and(|c| c.oldest_id.is_none())
                 {
                     FetchKind::Initial
                 } else {
@@ -732,7 +764,18 @@ impl NmnlApp {
                 }
             }
             AppEvent::Subscribed { channel, sub_id } => {
-                self.subs.insert(channel, sub_id);
+                self.pending_subs.remove(&channel);
+                // ack 到着時点でチャンネルが不要になっていたら即解除する
+                let still_needed = self
+                    .deck
+                    .columns
+                    .iter()
+                    .any(|c| c.stream_channel().as_ref() == Some(&channel));
+                if still_needed {
+                    self.subs.insert(channel, sub_id);
+                } else if let Some(stream) = &self.stream {
+                    stream.unsubscribe(&sub_id);
+                }
             }
             AppEvent::Stream(ev) => {
                 self.handle_stream_event(ev, ctx);
@@ -740,11 +783,17 @@ impl NmnlApp {
             AppEvent::FetchResult {
                 col_id,
                 kind,
+                fetch_gen,
                 result,
             } => {
                 let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
                     return;
                 };
+                // 発行後に invalidate(TL 種別/チャンネル/フィルタ変更)されていたら
+                // 前世代の結果は捨てる。新しい構成に古い内容が混入するのを防ぐ
+                if col.fetch_gen != fetch_gen {
+                    return;
+                }
                 // 生応答が空なら過去は尽きた(F-03-3)。フィルタで全件落ちても
                 // カーソルは進むので raw の空判定は oldest_id/件数で見る
                 let raw_empty = match &result {
@@ -753,27 +802,40 @@ impl NmnlApp {
                     Ok(FetchResult::Notifications(v)) => v.is_empty(),
                     Err(_) => false,
                 };
+                let backfill = matches!(kind, FetchKind::Backfill);
                 match result {
                     Ok(FetchResult::Page(page)) => {
-                        col.append_page(page.notes, page.oldest_id, page.newest_id);
+                        if backfill {
+                            col.append_backfill(page.notes, page.oldest_id, page.newest_id);
+                        } else {
+                            col.append_page(page.notes, page.oldest_id, page.newest_id);
+                        }
                     }
                     Ok(FetchResult::Mentions(notes)) => {
                         // メンションもカーソルは生応答の先頭/末尾から取る
                         let newest = notes.first().map(|n| n.id.clone());
                         let oldest = notes.last().map(|n| n.id.clone());
-                        col.append_page(notes, oldest, newest);
+                        if backfill {
+                            col.append_backfill(notes, oldest, newest);
+                        } else {
+                            col.append_page(notes, oldest, newest);
+                        }
                     }
                     Ok(FetchResult::Notifications(notifs)) => {
                         let newest = notifs.first().map(|n| n.id.clone());
                         let oldest = notifs.last().map(|n| n.id.clone());
-                        col.append_notif_page(notifs, oldest, newest);
+                        if backfill {
+                            col.append_notif_backfill(notifs, oldest, newest);
+                        } else {
+                            col.append_notif_page(notifs, oldest, newest);
+                        }
                     }
                     Err(msg) => {
                         col.error = Some(msg);
                     }
                 }
                 col.fetching = false;
-                if raw_empty && !matches!(kind, FetchKind::Backfill) {
+                if raw_empty && !backfill {
                     col.exhausted = true;
                 }
             }
@@ -819,16 +881,28 @@ impl NmnlApp {
                 picker.loading = false;
                 match result {
                     Ok(list) => picker.followed = list,
-                    Err(e) => col.error = Some(e),
+                    Err(e) => {
+                        // 失敗しても loaded を true のままにすると再試行しないので戻す
+                        picker.followed_loaded = false;
+                        col.error = Some(e);
+                    }
                 }
             }
-            AppEvent::ChannelSearchResult { col_id, result } => {
+            AppEvent::ChannelSearchResult {
+                col_id,
+                query,
+                result,
+            } => {
                 let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
                     return;
                 };
                 let Some(picker) = col.channel_picker.as_mut() else {
                     return;
                 };
+                // 古いクエリの応答が遅れて届いた場合は現在の検索結果を上書きしない
+                if picker.query != query {
+                    return;
+                }
                 picker.loading = false;
                 match result {
                     Ok(list) => picker.results = list,
@@ -886,6 +960,88 @@ async fn fetch_page_impl(
             .map_err(|e| e.to_string()),
         ColumnKind::Main => Err("メインカラムは取得対象外です".to_owned()),
     }
+}
+
+/// 欠落補充の連続ページ上限。異常ループ防止の上限で、実用上は
+/// 数分の切断で 1 ページ、長時間なら数ページで収まる
+const BACKFILL_MAX_PAGES: u32 = 10;
+
+/// 欠落補充(F-03-6): sinceId の区間が 1 ページに収まらないときは
+/// untilId でさらに歩き、切断時点の境界に到達するまで取り切る
+async fn fetch_backfill_impl(
+    client: &ApiClient,
+    spec: &ColumnSpec,
+    paging: Paging,
+    ntf_excludes: &[String],
+) -> Result<FetchResult, String> {
+    let Some(since) = paging.since_id.clone() else {
+        return fetch_page_impl(client, spec, &paging, ntf_excludes).await;
+    };
+    let mut cur = Paging {
+        since_id: Some(since.clone()),
+        until_id: None,
+        limit: paging.limit,
+    };
+    let mut notes: Vec<Note> = Vec::new();
+    let mut notifs: Vec<Notification> = Vec::new();
+    let mut merged_oldest: Option<String> = None;
+    let mut merged_newest: Option<String> = None;
+    for _ in 0..BACKFILL_MAX_PAGES {
+        let result = fetch_page_impl(client, spec, &cur, ntf_excludes).await?;
+        // ページ末尾(最古側)の ID。次ページの untilId と境界判定に使う
+        let page_oldest = match &result {
+            FetchResult::Page(p) => p.oldest_id.clone(),
+            FetchResult::Mentions(v) => v.last().map(|n| n.id.clone()),
+            FetchResult::Notifications(v) => v.last().map(|n| n.id.clone()),
+        };
+        match result {
+            FetchResult::Page(p) => {
+                // newest は最初のページのものが区間の先端
+                if merged_newest.is_none() {
+                    merged_newest = p.newest_id;
+                }
+                merged_oldest = p.oldest_id.clone().or(merged_oldest);
+                notes.extend(p.notes);
+            }
+            FetchResult::Mentions(v) => {
+                if merged_newest.is_none() {
+                    merged_newest = v.first().map(|n| n.id.clone());
+                }
+                if let Some(o) = v.last().map(|n| n.id.clone()) {
+                    merged_oldest = Some(o);
+                }
+                notes.extend(v);
+            }
+            FetchResult::Notifications(v) => {
+                if merged_newest.is_none() {
+                    merged_newest = v.first().map(|n| n.id.clone());
+                }
+                if let Some(o) = v.last().map(|n| n.id.clone()) {
+                    merged_oldest = Some(o);
+                }
+                notifs.extend(v);
+            }
+        }
+        // このページの最古 ID が切断時点の境界(含む)まで達したら打ち切り。
+        // 空応答(None)も打ち切り条件(区間が尽きた)
+        let reached = match &page_oldest {
+            None => true,
+            Some(o) => o.as_str() <= since.as_str(),
+        };
+        if reached {
+            break;
+        }
+        cur.until_id = page_oldest;
+    }
+    Ok(match spec.kind {
+        ColumnKind::Notifications => FetchResult::Notifications(notifs),
+        ColumnKind::Mentions => FetchResult::Mentions(notes),
+        _ => FetchResult::Page(TimelinePage {
+            notes,
+            oldest_id: merged_oldest,
+            newest_id: merged_newest,
+        }),
+    })
 }
 
 impl eframe::App for NmnlApp {

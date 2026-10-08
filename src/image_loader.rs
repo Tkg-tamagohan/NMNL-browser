@@ -18,8 +18,54 @@ use std::sync::Arc;
 
 /// ディスクキャッシュの容量上限(F-09-3)。256MiB
 const DISK_CACHE_CAP: u64 = 256 * 1024 * 1024;
-/// メモリキャッシュのエントリ上限。超えたら全消去(粗いが bounded な実装)
+/// メモリキャッシュのエントリ上限(LRU 順に eviction)
 const MEM_CACHE_CAP: usize = 2000;
+/// 画像 URL のリダイレクト追従上限(リダイレクトループ対策)
+const MAX_REDIRECTS: u32 = 5;
+
+/// メモリキャッシュ。HashMap + 挿入順キューの簡易 LRU(F-09-3)。
+/// ヒット時にキーを末尾へ積み直し、上限超過で最古参照から捨てる
+struct MemCache {
+    map: HashMap<String, Entry>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl MemCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, uri: &str) -> Option<&Entry> {
+        if self.map.contains_key(uri) {
+            self.order.push_back(uri.to_owned());
+        }
+        self.map.get(uri)
+    }
+
+    fn insert(&mut self, uri: String, entry: Entry) {
+        self.map.insert(uri.clone(), entry);
+        self.order.push_back(uri);
+        while self.map.len() > MEM_CACHE_CAP {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            // 二重登録された古いキーも既に map に無いなら no-op で読み飛ばす
+            self.map.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, uri: &str) {
+        self.map.remove(uri);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
 
 #[derive(Clone)]
 enum Entry {
@@ -33,7 +79,7 @@ enum Entry {
 
 /// 遅延読み込みとディスクキャッシュを行う画像バイトローダー
 pub struct CachedImageLoader {
-    cache: Arc<Mutex<HashMap<String, Entry>>>,
+    cache: Arc<Mutex<MemCache>>,
     cache_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     client: reqwest::Client,
@@ -48,10 +94,15 @@ impl CachedImageLoader {
             .unwrap_or_else(|| std::env::temp_dir().join("nmnl-browser-images"));
         let _ = std::fs::create_dir_all(&cache_dir);
         Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(MemCache::new())),
             cache_dir,
             runtime,
-            client: reqwest::Client::new(),
+            // リダイレクトは手動で追う。ホップごとにスキームと宛先 IP を
+            // 再検証して SSRF の迂回を防ぐ(N-02)
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -83,6 +134,7 @@ impl CachedImageLoader {
     fn mem_bytes(&self) -> usize {
         self.cache
             .lock()
+            .map
             .values()
             .map(|e| match e {
                 Entry::Ready(b, _) => b.len(),
@@ -156,11 +208,12 @@ impl BytesLoader for CachedImageLoader {
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str) -> BytesLoadResult {
-        if !(uri.starts_with("https://") || uri.starts_with("http://")) {
+        // 通信は https のみ(N-02)。http の画像は拒否する
+        if !uri.starts_with("https://") {
             return Err(LoadError::NotSupported);
         }
         {
-            let cache = self.cache.lock();
+            let mut cache = self.cache.lock();
             match cache.get(uri) {
                 Some(Entry::Ready(bytes, mime)) => {
                     return Ok(BytesPoll::Ready {
@@ -179,12 +232,9 @@ impl BytesLoader for CachedImageLoader {
             }
         }
 
-        // メモリキャッシュのエントリ上限。超過時は全消去(再フェッチされる)
+        // メモリキャッシュへ Pending 登録(上限超過は LRU の最古から落とす)
         {
             let mut cache = self.cache.lock();
-            if cache.len() >= MEM_CACHE_CAP {
-                cache.clear();
-            }
             cache.insert(uri.to_owned(), Entry::Pending);
         }
 
@@ -217,17 +267,95 @@ impl BytesLoader for CachedImageLoader {
     fn has_pending(&self) -> bool {
         self.cache
             .lock()
+            .map
             .values()
             .any(|e| matches!(e, Entry::Pending))
     }
 }
 
+/// IP がグローバル到達可能か。プライベート・ループバック・リンクローカル等
+/// の内部宛てを弾いて SSRF を緩和する(N-02 の延長として防御)
+fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // RFC1918/loopback/link-local に加え、CGNAT(100.64/10)、
+            // benchmarking(198.18/15)、予約済み(240/4)、documentation
+            // (192.0.2・198.51.100・203.0.113)も内部宛てとして弾く
+            let manual = o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xC0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                || o[0] >= 240;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || manual)
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local())
+        }
+    }
+}
+
+/// URL の宛先を検証する。https のみ許可し、ホストが非グローバル IP に
+/// 解決される場合は拒否する(IP リテラル直打ちも同じ検査に通す)
+async fn validate_image_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("URL が不正: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("http スキームは許可しない".to_owned());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "ホスト名がありません".to_owned())?;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !is_public_ip(&ip) {
+            return Err("内部宛ての URL は拒否".to_owned());
+        }
+        return Ok(());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    // DNS 解決して宛先 IP を検査する。接続時の再解決との差(TOCTOU)は
+    // 残存リスクとして受容する(クライアント側 fetcher の実務的な緩和)
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => {
+            let mut saw_public = false;
+            for sa in addrs {
+                if !is_public_ip(&sa.ip()) {
+                    return Err("内部宛ての URL は拒否".to_owned());
+                }
+                saw_public = true;
+            }
+            if saw_public {
+                Ok(())
+            } else {
+                Err("名前解決できません".to_owned())
+            }
+        }
+        Err(e) => Err(format!("名前解決に失敗: {e}")),
+    }
+}
+
 /// URI を解決して Entry を返す非同期部。メモリに無いときだけ呼ばれる
 async fn load_uri(client: reqwest::Client, cache_dir: PathBuf, uri: &str, path: &PathBuf) -> Entry {
-    // ディスクヒット
+    // ディスクヒット(mtime を更新して LRU 順を維持する)
     if let Ok(bytes) = std::fs::read(path)
         && !bytes.is_empty()
     {
+        if let Ok(f) = std::fs::File::options().write(true).open(path) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -236,12 +364,44 @@ async fn load_uri(client: reqwest::Client, cache_dir: PathBuf, uri: &str, path: 
         return Entry::Ready(egui::load::Bytes::from(bytes), mime_from_ext(&ext));
     }
 
-    // HTTP 取得
-    let resp = match client.get(uri).send().await {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return Entry::Failed(format!("HTTP {}", r.status())),
-        Err(e) => return Entry::Failed(e.to_string()),
+    // HTTPS 取得。リダイレクトはホップごとに宛先を再検証して手動で追う
+    let mut url = uri.to_owned();
+    let mut hops = 0u32;
+    let resp = loop {
+        if let Err(e) = validate_image_url(&url).await {
+            return Entry::Failed(e);
+        }
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => return Entry::Failed(e.to_string()),
+        };
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+        hops += 1;
+        if hops > MAX_REDIRECTS {
+            return Entry::Failed("リダイレクト回数超過".to_owned());
+        }
+        let Some(loc) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Entry::Failed(format!("HTTP {}", resp.status()));
+        };
+        // 相対 Location の解決のため現在の URL を基底に join する
+        let base = match reqwest::Url::parse(&url) {
+            Ok(u) => u,
+            Err(e) => return Entry::Failed(e.to_string()),
+        };
+        url = match base.join(loc) {
+            Ok(u) => u.to_string(),
+            Err(e) => return Entry::Failed(e.to_string()),
+        };
     };
+    if !resp.status().is_success() {
+        return Entry::Failed(format!("HTTP {}", resp.status()));
+    }
     let mime = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -263,4 +423,39 @@ async fn load_uri(client: reqwest::Client, cache_dir: PathBuf, uri: &str, path: 
         egui::load::Bytes::from(bytes.to_vec()),
         mime.or_else(|| mime_from_ext(&ext_from_uri(uri))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MED-02: http スキームと内部宛て IP を拒否する(N-02 の延長)
+    #[test]
+    fn med02_public_ip_check() {
+        assert!(!is_public_ip(&"10.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip(&"192.168.1.1".parse().unwrap()));
+        assert!(!is_public_ip(&"127.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip(&"169.254.1.1".parse().unwrap()));
+        assert!(!is_public_ip(&"100.64.0.1".parse().unwrap()));
+        assert!(!is_public_ip(&"::1".parse().unwrap()));
+        assert!(!is_public_ip(&"fc00::1".parse().unwrap()));
+        assert!(!is_public_ip(&"fe80::1".parse().unwrap()));
+        assert!(is_public_ip(&"8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip(&"54.230.0.1".parse().unwrap()));
+        assert!(is_public_ip(&"2606:4700::1111".parse().unwrap()));
+    }
+
+    /// MED-03: http スキームと IP リテラルの内部宛ては即座に拒否する
+    #[tokio::test]
+    async fn med03_validate_rejects_insecure_and_internal() {
+        assert!(
+            validate_image_url("http://example.com/a.png")
+                .await
+                .is_err()
+        );
+        assert!(validate_image_url("https://127.0.0.1/a.png").await.is_err());
+        assert!(validate_image_url("https://10.0.0.5/a.png").await.is_err());
+        assert!(validate_image_url("https://[::1]/a.png").await.is_err());
+        assert!(validate_image_url("not-a-url").await.is_err());
+    }
 }

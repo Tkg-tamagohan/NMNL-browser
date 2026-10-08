@@ -369,10 +369,12 @@ fn timeline_body(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
     // スクロール下端に達していたら追加読み込みを要求する(F-03-3)
     let view = scroll.inner_rect;
     let content_bottom = scroll.inner;
+    // フィルタで初回ページが全件落ちても items は空のままなので、
+    // 発行条件は items ではなく過去カーソル(oldest_id)の有無で見る
     if content_bottom <= view.bottom() + 40.0
         && !col.exhausted
         && !col.fetching
-        && !col.items.is_empty()
+        && col.oldest_id.is_some()
         && matches!(
             col.spec.kind,
             crate::config::ColumnKind::Channel

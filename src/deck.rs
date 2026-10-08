@@ -82,6 +82,55 @@ impl NotificationFilter {
     }
 }
 
+/// 既受信 ID の上限つき集合(メモリ増殖対策)。挿入順を別に持ち、
+/// 上限超過で最古から捨てる。cap を超えると dedup は緩むが、
+/// 長時間稼働での無制限増殖を止める方を優先する
+struct SeenIds {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+/// dedup 集合の上限。表示 500 + フィルタ落ち + 補充分を余裕で覆う
+const SEEN_CAP: usize = 10_000;
+/// 一時停止の保留上限。溢れた分は補充で再取得する前提で捨てる
+const PENDING_CAP: usize = 500;
+
+impl SeenIds {
+    fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    /// HashSet::insert と同じ意味(新規なら true)
+    fn insert(&mut self, id: String) -> bool {
+        if !self.set.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.order.len() > SEEN_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.set.remove(id);
+    }
+
+    fn clear(&mut self) {
+        self.set.clear();
+        self.order.clear();
+    }
+}
+
 /// カラムに並ぶ項目。TL/メンション/チャンネルは Note、通知カラムは Notification
 #[derive(Debug)]
 pub enum ColumnItems {
@@ -111,7 +160,12 @@ pub struct Column {
     pub view: ColumnView,
     pub items: ColumnItems,
     /// 表示中・バッファ中を含む既受信 ID(dedup 用)
-    seen_ids: HashSet<String>,
+    seen_ids: SeenIds,
+    /// 切断時点の最新 ID(再接続時の欠落補充の起点。復帰までの新着に
+    /// 追い抜かれないよう切り離して保持する)
+    pub backfill_since: Option<String>,
+    /// invalidate ごとに増える世代番号。飛行中の REST 結果を破棄する印
+    pub fetch_gen: u64,
     /// 既受信の最新 ID(欠落補充 sinceId の起点)
     pub newest_id: Option<String>,
     /// 既受信の最古 ID(過去ページ untilId の起点)
@@ -140,13 +194,16 @@ impl Column {
             ColumnKind::Notifications => ColumnItems::Notifications(VecDeque::new()),
             _ => ColumnItems::Notes(VecDeque::new()),
         };
+        let ntf_excluded = spec.ntf_exclude.iter().cloned().collect();
         Self {
             id,
             spec,
             paused: false,
             view: ColumnView::default(),
             items,
-            seen_ids: HashSet::new(),
+            seen_ids: SeenIds::new(),
+            backfill_since: None,
+            fetch_gen: 0,
             newest_id: None,
             oldest_id: None,
             exhausted: false,
@@ -155,7 +212,9 @@ impl Column {
             pending_notes: VecDeque::new(),
             pending_notifs: VecDeque::new(),
             sub_id: None,
-            ntf_filter: NotificationFilter::default(),
+            ntf_filter: NotificationFilter {
+                excluded: ntf_excluded,
+            },
             channel_picker: None,
             dirty: false,
         }
@@ -204,23 +263,56 @@ impl Column {
         }
         self.seen_ids.insert(note.id.clone());
         if self.paused {
-            self.pending_notes.push_back(note);
+            if self.pending_notes.len() < PENDING_CAP {
+                self.pending_notes.push_back(note);
+            }
             return false;
         }
         self.insert_note_sorted(note);
         true
     }
 
-    /// ノートを ID 降順(新しい順)の正しい位置に挿入する。
-    /// AID 系 ID は辞書順が時系列と一致する前提
-    fn insert_note_sorted(&mut self, note: Note) {
+    /// ソート位置に挿入するだけ(cap 適用は呼び側が方向で選ぶ)
+    fn insert_note_at(&mut self, note: Note) {
         self.bump_cursors(Some(&note.id), Some(&note.id));
         if let ColumnItems::Notes(items) = &mut self.items {
             let pos = items.partition_point(|existing| existing.id > note.id);
             items.insert(pos, note);
-            if items.len() > ITEMS_CAP {
-                items.truncate(ITEMS_CAP);
+        }
+    }
+
+    /// 新着方向の挿入。上限超過は末尾(最古)を落とす
+    fn insert_note_sorted(&mut self, note: Note) {
+        self.insert_note_at(note);
+        if let ColumnItems::Notes(items) = &mut self.items {
+            items.truncate(ITEMS_CAP);
+        }
+    }
+
+    /// 過去方向ページ追加後の上限超過は先頭(最新)側を落とす。
+    /// 落とした分は seen_ids から外し、newest_id も繰り下げて
+    /// 補充で再取得できる状態に戻す
+    fn trim_front_overflow(&mut self) {
+        // 上限を超えたときだけ先頭を落とす。落とさない場合はカーソルを触らない
+        let excess = self.items.len().saturating_sub(ITEMS_CAP);
+        if excess == 0 {
+            return;
+        }
+        let (dropped, new_front): (Vec<String>, Option<String>) = match &mut self.items {
+            ColumnItems::Notes(items) => {
+                let dropped: Vec<String> = items.drain(..excess).map(|n| n.id).collect();
+                (dropped, items.front().map(|n| n.id.clone()))
             }
+            ColumnItems::Notifications(items) => {
+                let dropped: Vec<String> = items.drain(..excess).map(|n| n.id).collect();
+                (dropped, items.front().map(|n| n.id.clone()))
+            }
+        };
+        for id in dropped {
+            self.seen_ids.remove(&id);
+        }
+        if let Some(f) = new_front {
+            self.newest_id = Some(f);
         }
     }
 
@@ -235,10 +327,40 @@ impl Column {
     ) {
         for note in notes {
             if self.seen_ids.insert(note.id.clone()) {
-                self.insert_note_sorted(note);
+                self.insert_note_at(note);
             }
         }
         // カーソルはフィルタ前の応答から取る(フィルタで全件落ちても辿れる)
+        self.bump_cursors(raw_newest.as_deref(), raw_oldest.as_deref());
+        // 過去方向で溢れた分は先頭(最新)側を落とす。末尾を落とすと
+        // 取ったばかりの古いページが即捨てられて表示されない(BUG 対応)
+        self.trim_front_overflow();
+        self.fetching = false;
+    }
+
+    /// 再接続の欠落補充(新着方向)。一時停止中は保留に積み、
+    /// 表示には載せない(F-02-2 の一時停止は更新を止める契約)
+    pub fn append_backfill(
+        &mut self,
+        notes: Vec<Note>,
+        raw_oldest: Option<String>,
+        raw_newest: Option<String>,
+    ) {
+        for note in notes {
+            if !self.seen_ids.insert(note.id.clone()) {
+                continue;
+            }
+            if !api::note_allowed(&note, &self.spec.filters) {
+                continue;
+            }
+            if self.paused {
+                if self.pending_notes.len() < PENDING_CAP {
+                    self.pending_notes.push_back(note);
+                }
+                continue;
+            }
+            self.insert_note_sorted(note);
+        }
         self.bump_cursors(raw_newest.as_deref(), raw_oldest.as_deref());
         self.fetching = false;
     }
@@ -260,10 +382,39 @@ impl Column {
                 if let ColumnItems::Notifications(items) = &mut self.items {
                     let pos = items.partition_point(|existing| existing.id > n.id);
                     items.insert(pos, n);
-                    if items.len() > ITEMS_CAP {
-                        items.truncate(ITEMS_CAP);
-                    }
                 }
+            }
+        }
+        self.bump_cursors(raw_newest.as_deref(), raw_oldest.as_deref());
+        self.trim_front_overflow();
+        self.fetching = false;
+    }
+
+    /// 通知の欠落補充(新着方向)。一時停止中は保留に積む
+    pub fn append_notif_backfill(
+        &mut self,
+        notifs: Vec<Notification>,
+        raw_oldest: Option<String>,
+        raw_newest: Option<String>,
+    ) {
+        for n in notifs {
+            if !self.seen_ids.insert(n.id.clone()) {
+                continue;
+            }
+            if !self.ntf_filter.allows(&n.kind) {
+                continue;
+            }
+            if self.paused {
+                if self.pending_notifs.len() < PENDING_CAP {
+                    self.pending_notifs.push_back(n);
+                }
+                continue;
+            }
+            self.bump_cursors(None, None);
+            if let ColumnItems::Notifications(items) = &mut self.items {
+                let pos = items.partition_point(|existing| existing.id > n.id);
+                items.insert(pos, n);
+                items.truncate(ITEMS_CAP);
             }
         }
         self.bump_cursors(raw_newest.as_deref(), raw_oldest.as_deref());
@@ -278,7 +429,9 @@ impl Column {
         }
         self.seen_ids.insert(n.id.clone());
         if self.paused {
-            self.pending_notifs.push_back(n);
+            if self.pending_notifs.len() < PENDING_CAP {
+                self.pending_notifs.push_back(n);
+            }
             return false;
         }
         self.bump_cursors(Some(&n.id), Some(&n.id));
@@ -344,6 +497,8 @@ impl Column {
         self.fetching = false;
         self.error = None;
         self.view = ColumnView::default();
+        self.backfill_since = None;
+        self.fetch_gen += 1;
         self.dirty = true;
     }
 }
@@ -420,6 +575,8 @@ impl AddableKind {
 pub struct ColumnDeck {
     pub columns: Vec<Column>,
     next_id: u64,
+    /// カラム削除など、残ったカラムの dirty では表せない構成変更
+    dirty: bool,
 }
 
 impl ColumnDeck {
@@ -428,6 +585,7 @@ impl ColumnDeck {
         let mut deck = Self {
             columns: Vec::new(),
             next_id: 1,
+            dirty: false,
         };
         for spec in specs {
             deck.push(spec);
@@ -454,7 +612,12 @@ impl ColumnDeck {
     }
 
     pub fn remove(&mut self, id: u64) {
+        let len = self.columns.len();
         self.columns.retain(|c| c.id != id);
+        // 削除は残存カラムの dirty では表せないのでデッキ側で持つ
+        if self.columns.len() != len {
+            self.dirty = true;
+        }
     }
 
     /// ドラッグ並べ替え。`to` は除去前の区切り番号(COL-05 の補正と同じ)
@@ -507,6 +670,7 @@ impl ColumnDeck {
         if let Some(col) = self.columns.iter_mut().find(|c| c.id == id)
             && col.ntf_filter != filter
         {
+            col.spec.ntf_exclude = filter.excluded.iter().cloned().collect();
             col.ntf_filter = filter;
             col.invalidate();
         }
@@ -528,7 +692,8 @@ impl ColumnDeck {
     }
 
     pub fn take_dirty(&mut self) -> bool {
-        let dirty = self.columns.iter().any(|c| c.dirty);
+        let dirty = self.dirty || self.columns.iter().any(|c| c.dirty);
+        self.dirty = false;
         for c in &mut self.columns {
             c.dirty = false;
         }
@@ -792,5 +957,107 @@ mod tests {
         }
         assert_eq!(col.oldest_id.as_deref(), Some("n1"));
         assert_eq!(col.newest_id.as_deref(), Some("n3"));
+    }
+
+    /// COL-13: invalidate で取得世代が進む(飛行中の旧世代結果は捨てる)
+    #[test]
+    fn col13_invalidate_bumps_fetch_gen() {
+        let mut col = tl_column();
+        let gen0 = col.fetch_gen;
+        col.invalidate();
+        assert_eq!(col.fetch_gen, gen0 + 1);
+        assert!(col.backfill_since.is_none());
+    }
+
+    /// COL-14: 一時停止中の欠落補充は保留に積み、解除で合成する
+    #[test]
+    fn col14_paused_backfill_goes_pending() {
+        let mut col = tl_column();
+        col.append_page(
+            vec![note("n1")],
+            Some("n1".to_owned()),
+            Some("n1".to_owned()),
+        );
+        col.set_paused(true);
+        col.append_backfill(
+            vec![note("n3"), note("n2")],
+            Some("n2".to_owned()),
+            Some("n3".to_owned()),
+        );
+        // 一時停止中は表示を増やさない
+        assert_eq!(note_ids(&col), vec!["n1"]);
+        assert_eq!(col.pending_count(), 2);
+        // カーソルは進む(以降の補充の起点)
+        assert_eq!(col.newest_id.as_deref(), Some("n3"));
+        col.set_paused(false);
+        assert_eq!(note_ids(&col), vec!["n3", "n2", "n1"]);
+        assert_eq!(col.pending_count(), 0);
+    }
+
+    /// COL-15: 過去方向の追加で上限超過したら最新側を落とす
+    /// (末尾を落とすと取ったばかりの古いページが見えない)
+    #[test]
+    fn col15_page_overflow_evicts_front() {
+        let mut col = tl_column();
+        // 新着方向で cap まで埋める
+        for i in 0..ITEMS_CAP {
+            col.push_note(note(&format!("n{:06}", i + 1000)));
+        }
+        let top_before = note_ids(&col)[0].clone();
+        // 過去方向に cap を超えるページを追加
+        let older: Vec<Note> = (0..20).map(|i| note(&format!("n{:06}", 100 - i))).collect();
+        col.append_page(
+            older,
+            Some("n000081".to_owned()),
+            Some("n000100".to_owned()),
+        );
+        let ids = note_ids(&col);
+        assert_eq!(ids.len(), ITEMS_CAP);
+        // 末尾(最古側)は新しく取ったページが残る
+        assert_eq!(ids.last().unwrap().as_str(), "n000081");
+        // 先頭の新着は落ち、newest_id が繰り下がる
+        assert_ne!(top_before, ids[0]);
+        assert_eq!(col.newest_id.as_deref(), Some(ids[0].as_str()));
+    }
+
+    /// COL-16: カラム削除(残存カラムがあってもなくても)で dirty が立つ
+    #[test]
+    fn col16_remove_marks_deck_dirty() {
+        let mut deck = ColumnDeck::from_specs(vec![
+            ColumnSpec {
+                kind: ColumnKind::Timeline,
+                ..Default::default()
+            },
+            ColumnSpec {
+                kind: ColumnKind::Mentions,
+                ..Default::default()
+            },
+        ]);
+        deck.take_dirty(); // 初期状態の dirty を消費
+        assert!(!deck.take_dirty());
+        deck.remove(deck.columns[0].id);
+        assert!(deck.take_dirty());
+        assert!(!deck.take_dirty());
+        // 最後の 1 列の削除でも dirty は立つ
+        deck.remove(deck.columns[0].id);
+        assert!(deck.take_dirty());
+    }
+
+    /// NTF-04: 通知種別フィルタはカラム構成として保存・復元される(F-02-3/F-09-2)
+    #[test]
+    fn ntf04_filter_persists_in_spec() {
+        let mut deck = ColumnDeck::from_specs(vec![ColumnSpec {
+            kind: ColumnKind::Notifications,
+            ..Default::default()
+        }]);
+        let id = deck.columns[0].id;
+        let mut filter = NotificationFilter::default();
+        filter.excluded.insert("reaction".to_owned());
+        deck.set_ntf_filter(id, filter);
+        // 保存される構成に除外種別が含まれる
+        assert_eq!(deck.specs()[0].ntf_exclude, vec!["reaction".to_owned()]);
+        // 復元したカラムはフィルタが効いた状態で再構成される
+        let deck2 = ColumnDeck::from_specs(deck.specs());
+        assert!(deck2.columns[0].ntf_filter.excluded.contains("reaction"));
     }
 }
