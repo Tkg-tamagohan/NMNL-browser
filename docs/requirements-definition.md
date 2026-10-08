@@ -84,7 +84,7 @@ ID は `F-01` 形式とし、テストケースとの対応は実装計画で定
 - F-01-1: MiAuth の認可 URL をシステムブラウザで開き、トークンを取得する。
 - F-01-2: トークンは OS のキーリングに保存し、キーリングが利用できない環境では永続保存を行わず起動ごとの再認証とする。
 - F-01-3: トークンが失効したときは再認証を促す。
-- F-01-4: 要求権限は必要最小限とし、候補は read:account、write:notes、read:notifications、write:reactions、read:drive、write:drive、read:channels、read:user-groups とする(最終確定は実装時にエンドポイント仕様へ照合)。
+- F-01-4: 要求権限は必要最小限とし、read:account、write:notes、read:notifications、write:reactions、read:drive、write:drive、read:channels を要求する(read:user-groups はリストとアンテナが MVP 対象外のため含めない)。
 
 ### F-02 カラム管理
 
@@ -230,8 +230,8 @@ UI 基盤は仕様決定 A の egui(eframe)とし、構成要素は次のとお�
 
 通信の使い分けは次のとおり。
 
-- REST は `i`、`notes/home-timeline`、`notes/local-timeline`、`notes/hybrid-timeline`(ソーシャル)、`notes/global-timeline`、`notes/mentions`、`i/notifications`、`notes/show`、`notes/conversation`、`notes/create`、`notes/reactions/create`、`notes/reactions/delete`、`drive/files/create`、`users/show`、`meta`、チャンネル関連(`channels/search`、`channels/followed` など)、絵文字関連(`emojis` の一覧と個別取得)の各エンドポイントを使う(名前はいずれも実装時に検証)。
-- ストリーミングは `main`、`homeTimeline`、`localTimeline`、`socialTimeline`、`globalTimeline`、`channel` のチャンネルを購読する(チャンネル名は実装時に検証)。
+- REST は `i`、`notes/timeline`(ホーム、io 実測で `notes/home-timeline` は 404)、`notes/local-timeline`、`notes/hybrid-timeline`(ソーシャル)、`notes/global-timeline`、`notes/mentions`、`i/notifications`、`notes/show`、`notes/conversation`、`notes/create`、`notes/reactions/create`、`notes/reactions/delete`、`drive/files/create`、`users/show`、`users/notes`、`meta`、チャンネル関連(`channels/search`、`channels/followed`、`channels/timeline`)、絵文字関連(`emojis` の一覧と `emoji` の個別取得)の各エンドポイントを使う(いずれも io 実測で確定)。
+- ストリーミングは `main`、`homeTimeline`、`localTimeline`、`hybridTimeline`(ソーシャル、io 実測で `socialTimeline` ではなくこの名)、`globalTimeline`、`channel` のチャンネルを購読する。
 
 構成は次の 3 層とする。
 
