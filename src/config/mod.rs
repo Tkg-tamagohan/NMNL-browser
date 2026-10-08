@@ -10,17 +10,39 @@ use std::path::PathBuf;
 
 pub const HOST: &str = "misskey.io";
 
+/// UI スケール(文字サイズ、F-09-5)の許容範囲と既定値
+pub const UI_SCALE_MIN: f32 = 0.8;
+pub const UI_SCALE_MAX: f32 = 1.5;
+pub const UI_SCALE_DEFAULT: f32 = 1.0;
+
+/// 保存値や入力を許容範囲に正規化する。非有限値(NaN 等)は既定値に戻す
+pub fn normalize_ui_scale(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(UI_SCALE_MIN, UI_SCALE_MAX)
+    } else {
+        UI_SCALE_DEFAULT
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
     pub window: WindowConfig,
     pub columns: Vec<ColumnSpec>,
+    /// UI 全体の拡縮倍率(F-09-5)。仕様決定 U で決定した範囲 0.8〜1.5
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+}
+
+fn default_ui_scale() -> f32 {
+    UI_SCALE_DEFAULT
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             window: WindowConfig::default(),
+            ui_scale: UI_SCALE_DEFAULT,
             // 仕様決定 C の MVP カラム構成
             columns: vec![
                 ColumnSpec {
@@ -150,8 +172,12 @@ impl AppConfig {
         let Ok(body) = std::fs::read_to_string(path) else {
             return Self::default();
         };
-        match toml::from_str(&body) {
-            Ok(cfg) => cfg,
+        match toml::from_str::<AppConfig>(&body) {
+            Ok(mut cfg) => {
+                // 手編集で範囲外の値が入っても描画が壊れないよう正規化する
+                cfg.ui_scale = normalize_ui_scale(cfg.ui_scale);
+                cfg
+            }
             Err(e) => {
                 eprintln!("config.toml の解釈に失敗したため既定値を使います: {e}");
                 Self::default()
@@ -262,5 +288,47 @@ width = 777.0
         assert_eq!(parsed.window.width, 777.0);
         assert_eq!(parsed.window.height, WindowConfig::default().height);
         assert_eq!(parsed.columns[0].kind, ColumnKind::Notifications);
+    }
+
+    // CFG-06: UI スケール(F-09-5)が保存・復元され、欠落時は 1.0、
+    // 範囲外や非有限値は読み込み時に正規化される
+    #[test]
+    fn cfg06_ui_scale_persisted_and_normalized() {
+        // 既定は 1.0、キーが無い既存の設定ファイルも 1.0
+        let parsed: AppConfig = toml::from_str(
+            r#"
+columns = [{ kind = "main" }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.ui_scale, UI_SCALE_DEFAULT);
+
+        // 変更値が往復する
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = AppConfig {
+            ui_scale: 1.3,
+            ..AppConfig::default()
+        };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_from(&path).ui_scale, 1.3);
+
+        // 範囲外はクランプ、NaN は既定値に戻す(TOML は nan を受理する)
+        let cfg2 = AppConfig {
+            ui_scale: 9.9,
+            ..AppConfig::default()
+        };
+        cfg2.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_from(&path).ui_scale, UI_SCALE_MAX);
+        assert_eq!(
+            normalize_ui_scale(f32::NAN),
+            UI_SCALE_DEFAULT,
+            "NaN は既定値に正規化される"
+        );
+        assert_eq!(
+            normalize_ui_scale(0.1),
+            UI_SCALE_MIN,
+            "下限未満は下限に正規化される"
+        );
     }
 }
