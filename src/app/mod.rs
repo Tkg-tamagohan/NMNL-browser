@@ -1364,10 +1364,10 @@ impl NmnlApp {
                 EmojiFetch::Found(url) => self.emoji_cache.complete(&name, Some(url)),
                 EmojiFetch::Missing => self.emoji_cache.complete(&name, None),
                 EmojiFetch::Transient => {
-                    self.emoji_cache.fail_transient(&name);
+                    let cooldown = self.emoji_cache.fail_transient(&name);
                     // クールダウン満了時に resolve が再要求できるよう、
                     // 期限時刻の再描画を予約する(放置だと再試行が走らない)
-                    ctx.request_repaint_after(emoji::RETRY_COOLDOWN);
+                    ctx.request_repaint_after(cooldown);
                 }
             },
             AppEvent::PostResult {

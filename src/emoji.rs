@@ -10,10 +10,13 @@ use std::time::{Duration, Instant};
 /// なしだと描画ごとに再要求が走りリクエスト嵐になる
 pub const RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// 一時失敗の再試行上限。io は存在しない絵文字名にも INTERNAL_ERROR を返すので、
-/// そのまま無限再試行すると「存在しない名前」を延々と問い合わせ続ける。
-/// 回数上限を超えたら不在扱い(否定キャッシュ)に倒す
+/// 短い間隔での再試行上限。これを超えたら長い間隔(RETRY_COOLDOWN_LONG)に
+/// 移行する。io は存在しない絵文字名にも INTERNAL_ERROR を返すので、
+/// 恒久否定には倒さない(429・障害の終息後に回復できるようにするため)
 const MAX_TRANSIENT_ATTEMPTS: u8 = 5;
+
+/// 失敗を繰り返した場合に移行する長い再試行間隔
+pub const RETRY_COOLDOWN_LONG: Duration = Duration::from_secs(300);
 
 /// アプリ全体の絵文字 URL キャッシュ。
 /// `None` は「サーバーに存在しない(404 など)」のキャッシュで、繰り返し
@@ -58,18 +61,20 @@ impl EmojiCache {
     }
 
     /// 一時的な失敗(429、通信障害など)を記録し、クールダウン後に再試行する。
-    /// 上限回数を超えたら不在扱いにして打ち切る
-    pub fn fail_transient(&mut self, name: &str) {
+    /// 短い間隔での再試行が上限に達したら長い間隔に移行する(恒久否定はしない)。
+    /// 返り値は次の再試行までの待ち時間
+    pub fn fail_transient(&mut self, name: &str) -> Duration {
         let attempts = self.fails.get(name).copied().unwrap_or(0) + 1;
-        if attempts >= MAX_TRANSIENT_ATTEMPTS {
+        let cooldown = if attempts >= MAX_TRANSIENT_ATTEMPTS {
             self.fails.remove(name);
-            self.retry_after.remove(name);
-            self.resolved.insert(name.to_owned(), None);
+            RETRY_COOLDOWN_LONG
         } else {
             self.fails.insert(name.to_owned(), attempts);
-            self.retry_after
-                .insert(name.to_owned(), Instant::now() + RETRY_COOLDOWN);
-        }
+            RETRY_COOLDOWN
+        };
+        self.retry_after
+            .insert(name.to_owned(), Instant::now() + cooldown);
+        cooldown
     }
 
     /// 取得待ちの名前一覧を取り出してクリアする(app の update で回収)
@@ -170,26 +175,27 @@ mod tests {
         assert!(c.drain_pending().is_empty());
     }
 
-    // EMO-03: 一時失敗が上限回数に達したら不在扱いに倒す(io は存在しない名にも
-    // INTERNAL_ERROR を返すので、無限再試行しない)。回数はクールダウン経過の
-    // 再要求をまたいで累計される(resolve→失敗のサイクルで上限に達すること)
+    // EMO-03: 短い間隔での再試行が上限に達したら長い間隔に移行する。
+    // 回数はクールダウン経過の再要求をまたいで累計される(resolve→失敗の
+    // サイクルで上限に達すること)。恒久否定には倒さない
     #[test]
-    fn emo03_transient_gives_up_after_cap() {
+    fn emo03_transient_switches_to_long_cooldown() {
         let mut c = EmojiCache::default();
+        let mut cooldown = Duration::ZERO;
         for _ in 0..MAX_TRANSIENT_ATTEMPTS {
             // resolve で要求 → 取得失敗のライフサイクルを回す
             assert!(c.resolve("a").is_none());
             let _ = c.drain_pending();
-            c.fail_transient("a");
-            // クールダウンを経過させる(上限到達でエントリが消えた後は触らない)
-            if c.retry_after.contains_key("a") {
-                c.retry_after
-                    .insert("a".to_owned(), Instant::now() - Duration::from_secs(60));
-            }
+            cooldown = c.fail_transient("a");
+            // クールダウンを経過させる
+            c.retry_after
+                .insert("a".to_owned(), Instant::now() - Duration::from_secs(1));
         }
-        // 否定キャッシュに倒れて再要求されない
+        assert_eq!(cooldown, RETRY_COOLDOWN_LONG);
+        // 上限到達後も否定キャッシュにならず、長い間隔の経過で再要求される
+        c.retry_after
+            .insert("a".to_owned(), Instant::now() - Duration::from_secs(1));
         assert!(c.resolve("a").is_none());
-        assert!(c.drain_pending().is_empty());
-        assert!(c.retry_after.is_empty());
+        assert_eq!(c.drain_pending(), vec!["a".to_owned()]);
     }
 }
