@@ -80,9 +80,11 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
     }
     .unwrap_or_else(|| note.id.clone());
     let card_rect = inner.response.rect;
-    // クリック = カード内で押下を開始し、カード内でリリース
+    // クリック = カード内で押下を開始し、カード内でリリース。
+    // primary_clicked は egui のクリック閾値(max_click_dist)考慮済みで、
+    // スクロール目的のドラッグは弾かれる
     let released = ui.ctx().input(|i| {
-        i.pointer.primary_released()
+        i.pointer.primary_clicked()
             && i.pointer
                 .press_origin()
                 .is_some_and(|p| card_rect.contains(p))

@@ -155,7 +155,7 @@ impl ApiClient {
                 code: format!("HTTP {}", status.as_u16()),
                 message: format!(
                     "非 JSON 応答(先頭 120 文字): {}",
-                    &text[..text.len().min(120)]
+                    text.chars().take(120).collect::<String>()
                 ),
             });
         }
