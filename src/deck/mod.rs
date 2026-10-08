@@ -40,7 +40,8 @@ pub enum ColumnView {
 }
 
 /// チャンネルカラムの選択 UI 状態(F-03-7)。
-/// 選択方法は仕様で「実装時に確定」とあり、フォロー中一覧+検索の組み合わせを採用した
+/// 仕様確定どおりフォロー中一覧(channels/followed)と検索(channels/search)の
+/// ピッカーで対象チャンネルを選択する
 #[derive(Debug, Default)]
 pub struct ChannelPicker {
     /// フォロー中チャンネル一覧(channels/followed)

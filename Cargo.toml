@@ -6,7 +6,7 @@ license = "MIT"
 description = "misskey.io 専用の軽量デッキクライアント"
 
 [workspace]
-members = ["mock"]
+members = []
 
 [dependencies]
 eframe = "0.32"
