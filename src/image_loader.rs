@@ -293,12 +293,7 @@ impl BytesLoader for CachedImageLoader {
             if let Entry::Failed(msg) = &result {
                 eprintln!("[image] 取得失敗: {uri_owned} -> {msg}");
             }
-            if generation.load(std::sync::atomic::Ordering::SeqCst) != gen_at_start {
-                // 取得中にキャッシュ消去が走った分は書き戻さない(MED-06)
-                let _ = std::fs::remove_file(&path);
-            } else {
-                cache.lock().insert(uri_owned, result);
-            }
+            store_result(&cache, &generation, gen_at_start, &path, uri_owned, result);
             ctx.request_repaint();
         });
         Ok(BytesPoll::Pending { size: None })
@@ -402,6 +397,24 @@ async fn validate_image_url(url: &str) -> Result<(), String> {
 }
 
 /// URI を解決して Entry を返す非同期部。メモリに無いときだけ呼ばれる
+/// 取得結果をメモリキャッシュへ格納する。
+/// 取得開始時と世代が変わっていた(途中で clear_all が走った)場合は
+/// 書き込まれたディスクファイルも消して採用しない(MED-06)
+fn store_result(
+    cache: &Arc<Mutex<MemCache>>,
+    generation: &std::sync::atomic::AtomicU64,
+    gen_at_start: u64,
+    path: &std::path::Path,
+    uri: String,
+    result: Entry,
+) {
+    if generation.load(std::sync::atomic::Ordering::SeqCst) != gen_at_start {
+        let _ = std::fs::remove_file(path);
+    } else {
+        cache.lock().insert(uri, result);
+    }
+}
+
 async fn load_uri(client: reqwest::Client, cache_dir: PathBuf, uri: &str, path: &PathBuf) -> Entry {
     // ディスクヒット前に宛先検証を通す(過去に保存済みの内部宛て画像も
     // ここで弾く。ディスクキャッシュは URL ハッシュで引くため検証不能)
@@ -562,5 +575,39 @@ mod tests {
         assert!(cache.map.contains_key("new"));
         assert_eq!(cache.map.len(), MEM_CACHE_CAP);
         assert_eq!(cache.lru.len(), MEM_CACHE_CAP);
+    }
+    // MED-06: 消去中に完了した取得は書き戻さない(世代カウンタ、F-09-3)
+    #[test]
+    fn med06_store_result_stale_generation() {
+        let dir = std::env::temp_dir().join(format!("nmnl-med06-{}", std::process::id()));
+        let path = dir.join("f.bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"img").unwrap();
+        let cache = Arc::new(Mutex::new(MemCache::new()));
+        let g = std::sync::atomic::AtomicU64::new(0);
+        // 取得開始(世代0)後に消去で世代1へ → 結果は破棄されファイルも消える
+        g.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        store_result(
+            &cache,
+            &g,
+            0,
+            &path,
+            "u1".to_owned(),
+            Entry::Ready(egui::load::Bytes::from(vec![1u8]), None),
+        );
+        assert!(cache.lock().get("u1").is_none());
+        assert!(!path.exists());
+        // 世代が一致する取得は採用される
+        std::fs::write(&path, b"img").unwrap();
+        store_result(
+            &cache,
+            &g,
+            1,
+            &path,
+            "u2".to_owned(),
+            Entry::Ready(egui::load::Bytes::from(vec![1u8]), None),
+        );
+        assert!(cache.lock().get("u2").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
