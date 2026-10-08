@@ -124,6 +124,16 @@ impl Composer {
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_owned();
+        // 同一ファイルの重複添付は io 側で INVALID_PARAM になる実測が
+        // あるため、同名+同サイズの二重追加は弾く
+        if self
+            .files
+            .iter()
+            .any(|f| f.name == name && f.data.len() == data.len())
+        {
+            self.error = Some(format!("同じファイルは重複添付できません: {name}"));
+            return;
+        }
         self.files.push(PendingFile {
             name,
             mime: mime.to_owned(),
@@ -226,5 +236,13 @@ mod tests {
             c2.push_dropped(Path::new(&format!("/tmp/{n}")), vec![0u8]);
         }
         assert_eq!(c2.files.len(), 4);
+
+        // 同一ファイル(同名+同サイズ)の二重添付は弾く
+        // (io が INVALID_PARAM を返す実測があった)
+        let mut c3 = Composer::default();
+        c3.push_dropped(Path::new("/tmp/same.png"), vec![7u8; 4]);
+        c3.push_dropped(Path::new("/tmp/same.png"), vec![7u8; 4]);
+        assert_eq!(c3.files.len(), 1);
+        assert!(c3.error.is_some());
     }
 }
