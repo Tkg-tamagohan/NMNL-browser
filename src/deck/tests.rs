@@ -40,6 +40,105 @@ fn note_ids(col: &Column) -> Vec<String> {
     }
 }
 
+/// mock/ の既定構成に相当する 3 カラムのデッキ(ホーム、ローカル、通知)
+fn three_column_deck() -> ColumnDeck {
+    ColumnDeck::from_specs(vec![
+        ColumnSpec {
+            kind: ColumnKind::Timeline,
+            timeline: Some(TimelineKind::Home),
+            ..ColumnSpec::default()
+        },
+        ColumnSpec {
+            kind: ColumnKind::Timeline,
+            timeline: Some(TimelineKind::Local),
+            ..ColumnSpec::default()
+        },
+        ColumnSpec {
+            kind: ColumnKind::Notifications,
+            ..ColumnSpec::default()
+        },
+    ])
+}
+
+// COL-01: カラムの追加と削除(F-02-1)
+#[test]
+fn col01_add_remove() {
+    let mut deck = three_column_deck();
+    let initial = deck.columns.len();
+    let id = deck.add(AddableKind::Timeline(TimelineKind::Global));
+    assert_eq!(deck.columns.len(), initial + 1);
+    let added = deck.columns.last().unwrap();
+    assert_eq!(added.spec.kind, ColumnKind::Timeline);
+    assert_eq!(added.spec.timeline, Some(TimelineKind::Global));
+    deck.remove(id);
+    assert_eq!(deck.columns.len(), initial);
+    assert!(deck.columns.iter().all(|c| c.id != id));
+}
+
+// COL-02: ドラッグによる並べ替え(F-02-1)
+#[test]
+fn col02_move() {
+    let mut deck = three_column_deck();
+    let first = deck.columns[0].id;
+    let last = deck.columns[deck.columns.len() - 1].id;
+    // 先頭を末尾へ
+    deck.move_to(first, deck.columns.len());
+    assert_eq!(deck.columns.last().unwrap().id, first);
+    // 末尾を先頭へ
+    deck.move_to(last, 0);
+    assert_eq!(deck.columns[0].id, last);
+}
+
+// COL-03: 幅の変更とクランプ(F-02-1)
+#[test]
+fn col03_width_clamp() {
+    let mut deck = three_column_deck();
+    let id = deck.columns[0].id;
+    deck.set_width(id, 400.0);
+    assert_eq!(deck.columns[0].spec.width, 400.0);
+    deck.set_width(id, 10.0);
+    assert_eq!(deck.columns[0].spec.width, COL_WIDTH_MIN);
+    deck.set_width(id, 9999.0);
+    assert_eq!(deck.columns[0].spec.width, COL_WIDTH_MAX);
+}
+
+// COL-04: カラムごとの更新一時停止(F-02-2)
+#[test]
+fn col04_pause() {
+    let mut deck = three_column_deck();
+    let id = deck.columns[0].id;
+    deck.set_paused(id, true);
+    assert!(deck.columns[0].paused);
+    deck.set_paused(id, false);
+    assert!(!deck.columns[0].paused);
+}
+
+// COL-05: 並べ替えの区切り位置補正(F-02-1、Devin Review 指摘の回帰)
+#[test]
+fn col05_move_boundary() {
+    let mut deck = three_column_deck();
+    let ids: Vec<u64> = deck.columns.iter().map(|c| c.id).collect();
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    // [A,B,C] で A を区切り 2(B|C 間)へ → [B,A,C]
+    deck.move_to(a, 2);
+    assert_eq!(
+        deck.columns.iter().map(|x| x.id).collect::<Vec<_>>(),
+        vec![b, a, c]
+    );
+    // [B,A,C] で C を区切り 1(B|A 間)へ → [B,C,A]
+    deck.move_to(c, 1);
+    assert_eq!(
+        deck.columns.iter().map(|x| x.id).collect::<Vec<_>>(),
+        vec![b, c, a]
+    );
+    // 同一区切りへの移動は変化なし(A の左区切り 2 へ A を移動)
+    deck.move_to(a, 2);
+    assert_eq!(
+        deck.columns.iter().map(|x| x.id).collect::<Vec<_>>(),
+        vec![b, c, a]
+    );
+}
+
 // COL-06: ストリーム差分は ID dedup され ID 降順(新しい順)で保持される(F-03-2)
 #[test]
 fn col06_push_dedup_sorted() {

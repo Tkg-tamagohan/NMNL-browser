@@ -381,6 +381,62 @@ mod tests {
         texts
     }
 
+    /// layout_pieces() の出力テキストを結合して返す(装飾は捨てて文字列だけ検査)
+    fn layout_text(input: &str) -> String {
+        pieces_of(input, &[]).concat()
+    }
+
+    /// layout_pieces() の全 Job のテキストと各区間の(範囲, 斜体)を返す
+    fn layout_sections(input: &str) -> (String, Vec<(std::ops::Range<usize>, bool)>) {
+        let ctx = egui::Context::default();
+        let mut sections = Vec::new();
+        let mut text = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut resolve = |_: &str| None;
+                for p in layout_pieces(input, ui, &mut resolve) {
+                    if let Piece::Job(j) = p {
+                        text.push_str(&j.text);
+                        for sec in &j.sections {
+                            sections.push((sec.byte_range.clone(), sec.format.italics));
+                        }
+                    }
+                }
+            });
+        });
+        (text, sections)
+    }
+
+    // MFM-01: 装飾記法は除去され、本文は残る(F-05-1/6)
+    #[test]
+    fn mfm01_markup_stripped() {
+        let out = layout_text("先に**太字**と`code`と*斜体*と~~取消~~です");
+        assert_eq!(out, "先に太字とcodeと斜体と取消です");
+    }
+
+    // MFM-02: マルチバイト文字を含んでもパニックしない(UTF-8 文字境界の回帰)
+    #[test]
+    fn mfm02_multibyte_safe() {
+        let out = layout_text("日本語の文に**太字**と`コード`と:emoji_name:を混ぜる");
+        assert!(out.contains("日本語の文に太字とコードと:emoji_name:を混ぜる"));
+        let out2 = layout_text("絵文字:reaction:と #タグ と@user@misskey.io");
+        assert!(out2.contains("#タグ"));
+    }
+
+    // MFM-03: 引用行の内側もインライン装飾が適用され、行全体が斜体(F-05-8)
+    #[test]
+    fn mfm03_quote_inline() {
+        let (text, sections) = layout_sections("> **強調**と@aliceの引用行");
+        assert!(text.starts_with("❝ "));
+        assert!(text.contains("強調と@aliceの引用行"), "out: {text}");
+        assert!(!text.contains("**"), "装飾記法が残っている: {text}");
+        // 引用記号と本文の全区間が斜体(メンション等の装飾色は維持する)
+        for (range, italics) in sections {
+            let t = &text[range];
+            assert!(italics, "斜体になっていない区間がある: {t:?}");
+        }
+    }
+
     // MFM-04: 絵文字マップで解決できた :name: は画像ピースになる(F-05-2)
     #[test]
     fn mfm04_emoji_piece() {
@@ -408,22 +464,7 @@ mod tests {
     // MFM-06: 引用行の内側もインライン装飾が適用され、行全体が斜体(F-05-8)
     #[test]
     fn mfm06_quote_inline() {
-        let ctx = egui::Context::default();
-        let mut job_sections = Vec::new();
-        let mut text = String::new();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut resolve = |_: &str| None;
-                for p in layout_pieces("> **強調**と@aliceの引用行", ui, &mut resolve) {
-                    if let Piece::Job(j) = p {
-                        text.push_str(&j.text);
-                        for sec in &j.sections {
-                            job_sections.push((sec.byte_range.clone(), sec.format.italics));
-                        }
-                    }
-                }
-            });
-        });
+        let (text, job_sections) = layout_sections("> **強調**と@aliceの引用行");
         assert!(text.starts_with("❝ "));
         assert!(text.contains("強調と@aliceの引用行"));
         assert!(!text.contains("**"));
