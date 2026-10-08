@@ -91,7 +91,7 @@ UI 層は API 層を直接呼ばず、イベント集約層を介する。
 | NOTE | F-05 ノート表示 | NOTE-01: show/conversation 応答デコード、NOTE-02: users/show 応答デコード、NOTE-03: emoji 個別応答デコード |
 | POST | F-06 投稿 | POST-01: notes/create リクエストボディ、POST-02: notes/create 応答デコード(createdNote ラッパー)、POST-03: フォーム状態→CreateNote 変換、POST-04: 添付受付(拡張子と 12 件上限) |
 | REA | F-07 リアクション | REA-01: 絵文字一覧応答デコード、REA-02: reactions/create は 204 を受理、REA-03: reactions/delete リクエストと 204 受理 |
-| DRV | F-06-2 ドライブ | DRV-01: drive/files/create の multipart 送信と応答デコード |
+| DRV | F-06-2 ドライブ | DRV-01: drive/files/create の multipart 送信と応答デコード、DRV-02: アップロード済み ID の再利用(リトライで再送しない) |
 | MED | F-08 メディア | MED-01: メディアの分類(画像=インライン/動画・音声=外部ブラウザ、F-08-1/-3)、MED-02: 画像 URL の非グローバル IP 拒否(N-02)、MED-03: http スキームと内部宛て URL の拒否(N-02)、MED-04: ディスクキャッシュ経由でも宛先検証が先(N-02)、MED-05: メモリキャッシュ LRU の厳密性(F-09-3) |
 | CFG | F-09 設定と保存 | CFG-01: 既定設定の TOML 往復、CFG-02: 項目欠落時の既定値、CFG-03: 原子的保存と復元、CFG-04: 壊れたファイルのフォールバック、CFG-05: window 部分欠落時に他設定を保持 |
 | API | API 層(N-03 堅牢性、N-05 設計制約) | API-01: meta 応答デコードと機能フラグ参照、API-02: トークン注入(モック HTTP)、API-03: エラー応答の解釈、API-04: 429 再試行、API-05: 公開エンドポイント往復、API-06: 非 JSON エラーボディの扱い |

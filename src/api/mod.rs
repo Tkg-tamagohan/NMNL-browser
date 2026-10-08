@@ -256,6 +256,29 @@ impl ApiClient {
         serde_json::from_value(value).map_err(|e| ApiError::Unexpected(e.to_string()))
     }
 
+    /// 投稿用の添付アップロード(F-06-2)。`uploaded_id` 済みのファイルは
+    /// 再アップロードせずその ID を使う(投稿失敗後のリトライで
+    /// ドライブに参照されないコピーが増えるのを防ぐ)。順序は files の
+    /// 並びをそのまま file_ids に写す
+    pub async fn upload_pending_files(
+        &self,
+        files: &mut [crate::composer::PendingFile],
+    ) -> Result<Vec<String>, ApiError> {
+        let mut ids = Vec::with_capacity(files.len());
+        for f in files.iter_mut() {
+            if let Some(id) = &f.uploaded_id {
+                ids.push(id.clone());
+                continue;
+            }
+            let df = self
+                .upload_drive_file(&f.name, &f.mime, (*f.data).clone())
+                .await?;
+            f.uploaded_id = Some(df.id.clone());
+            ids.push(df.id);
+        }
+        Ok(ids)
+    }
+
     /// `POST /api/i`: トークンの検証と自分の情報取得(F-01)
     pub async fn i(&self) -> Result<User, ApiError> {
         if self.token.is_none() {
@@ -1261,6 +1284,47 @@ mod tests {
             .unwrap();
         assert_eq!(file.id, "d1");
         assert_eq!(file.file_type, "image/png");
+        m.assert_async().await;
+    }
+
+    // DRV-02: upload_pending_files は uploaded_id 済みのファイルを
+    // 再アップロードせず、未アップロード分だけを順序通り ID 化する
+    #[tokio::test]
+    async fn drv02_pending_files_reuse_uploaded_id() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        // アップロードは 1 回だけ(2 件目のみ)
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/drive/files/create")
+                    .body_includes("filename=\"b.png\"");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "d-new", "name": "b.png", "type": "image/png"
+                    }));
+            })
+            .await;
+        let client =
+            ApiClient::for_test(format!("{}/api", server.base_url()), Some("tok".to_owned()));
+        let mut files = vec![
+            crate::composer::PendingFile {
+                name: "a.png".to_owned(),
+                mime: "image/png".to_owned(),
+                data: std::sync::Arc::new(vec![1u8]),
+                uploaded_id: Some("d-old".to_owned()),
+            },
+            crate::composer::PendingFile {
+                name: "b.png".to_owned(),
+                mime: "image/png".to_owned(),
+                data: std::sync::Arc::new(vec![2u8]),
+                uploaded_id: None,
+            },
+        ];
+        let ids = client.upload_pending_files(&mut files).await.unwrap();
+        assert_eq!(ids, vec!["d-old".to_owned(), "d-new".to_owned()]);
+        assert_eq!(files[1].uploaded_id.as_deref(), Some("d-new"));
         m.assert_async().await;
     }
 }

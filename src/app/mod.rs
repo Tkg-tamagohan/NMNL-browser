@@ -128,7 +128,11 @@ enum AppEvent {
     /// 絵文字のオンデマンド解決結果(F-05-2)
     EmojiResult { name: String, url: Option<String> },
     /// 投稿/返信/引用/リノートの結果(F-06)
-    PostResult { result: Result<Box<Note>, String> },
+    PostResult {
+        result: Result<Box<Note>, String>,
+        /// アップロード結果を反映した添付(失敗時にフォームへ戻す)
+        files: Vec<PendingFile>,
+    },
     /// リアクション付与/取消の結果(F-07)
     ReactionResult {
         note_id: String,
@@ -393,28 +397,19 @@ impl NmnlApp {
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.runtime.spawn(async move {
-            let mut failed = None;
-            for f in &files {
-                match client
-                    .upload_drive_file(&f.name, &f.mime, (*f.data).clone())
-                    .await
-                {
-                    Ok(d) => req.file_ids.push(d.id),
-                    Err(e) => {
-                        failed = Some(format!("添付 {} のアップロード失敗: {e}", f.name));
-                        break;
-                    }
+            let mut files = files;
+            let result = match client.upload_pending_files(&mut files).await {
+                Err(e) => Err(format!("添付のアップロード失敗: {e}")),
+                Ok(ids) => {
+                    req.file_ids = ids;
+                    client
+                        .create_note(&req)
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string())
                 }
-            }
-            let result = match failed {
-                Some(e) => Err(e),
-                None => client
-                    .create_note(&req)
-                    .await
-                    .map(Box::new)
-                    .map_err(|e| e.to_string()),
             };
-            let _ = tx.send(AppEvent::PostResult { result });
+            let _ = tx.send(AppEvent::PostResult { result, files });
             ctx2.request_repaint();
         });
     }
@@ -1159,7 +1154,7 @@ impl NmnlApp {
             AppEvent::EmojiResult { name, url } => {
                 self.emoji_cache.complete(&name, url);
             }
-            AppEvent::PostResult { result } => {
+            AppEvent::PostResult { result, files } => {
                 self.composer.posting = false;
                 match result {
                     Ok(note) => {
@@ -1169,6 +1164,9 @@ impl NmnlApp {
                         self.notice = Some(format!("投稿しました({})", note.id));
                     }
                     Err(e) => {
+                        // アップロード済み ID 入りの添付をフォームへ戻す。
+                        // リトライで同じファイルを再アップロードしないため
+                        self.composer.files = files;
                         self.composer.error = Some(format!("投稿に失敗: {e}"));
                         self.notice = None;
                     }

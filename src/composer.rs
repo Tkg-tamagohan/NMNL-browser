@@ -31,6 +31,9 @@ pub struct PendingFile {
     pub name: String,
     pub mime: String,
     pub data: Arc<Vec<u8>>,
+    /// アップロード済みのドライブ ID。投稿失敗後のリトライで
+    /// 同じファイルを再アップロードしないよう保持する
+    pub uploaded_id: Option<String>,
 }
 
 /// 返信/引用の対象表示用の最小情報
@@ -125,6 +128,7 @@ impl Composer {
             name,
             mime: mime.to_owned(),
             data: Arc::new(data),
+            uploaded_id: None,
         });
     }
 
