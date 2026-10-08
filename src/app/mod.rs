@@ -50,7 +50,7 @@ enum AuthState {
         message: String,
     },
     Authenticated {
-        user: User,
+        user: Box<User>,
     },
 }
 
@@ -145,6 +145,11 @@ enum AppEvent {
     },
     /// ピッカー用絵文字一覧の取得結果(F-07-3)
     EmojiListResult { result: Result<Vec<Emoji>, String> },
+    /// プロフィールの取得結果(F-05-6)。users/show と users/notes を一括で取る
+    ProfileResult {
+        user: Result<Box<User>, String>,
+        notes: Result<Vec<Note>, String>,
+    },
     /// ストリーミング層からの転送イベント
     Stream(StreamEvent),
 }
@@ -194,6 +199,39 @@ pub struct NmnlApp {
     reaction_picker: Option<ReactionPickerState>,
     /// 操作結果の一行通知(投稿成功・失敗など)
     notice: Option<String>,
+    // Phase 8: 仕上げ
+    /// 画像ビューアの開閉状態(F-08-1)
+    viewer: Option<ui::ViewerState>,
+    /// プロフィールウィンドウ(F-05-6)
+    profile: Option<ProfileState>,
+    /// 設定ウィンドウの開閉(F-09-3)
+    settings_win: bool,
+    /// キャッシュの現在サイズ(画像, 絵文字一覧)。設定画面を開く/消すときに更新
+    cache_sizes: (u64, u64),
+    /// 画像キャッシュのローダー(egui の bytes loader 兼キャッシュ消去の入口)
+    image_loader: Option<Arc<crate::image_loader::CachedImageLoader>>,
+    /// トレイ常駐(F-09-4)。ビルドに失敗した環境では None として通常動作に落ちる
+    tray: Option<tray_icon::TrayIcon>,
+    /// トレイメニュー「表示」の ID
+    tray_show_id: tray_icon::menu::MenuId,
+    /// トレイメニュー「終了」の ID
+    tray_quit_id: tray_icon::menu::MenuId,
+    /// トレイに入った(非表示)状態か。隠れた間も低頻度で repaint して
+    /// トレイイベントを拾い続ける
+    hidden_to_tray: bool,
+    /// N-01 の起動時間を最初のフレームで一度だけログに出すフラグ
+    startup_logged: bool,
+}
+
+/// プロフィールウィンドウの状態(F-05-6)
+#[derive(Debug, Default)]
+pub struct ProfileState {
+    pub user_id: String,
+    pub user: Option<User>,
+    pub notes: Vec<Note>,
+    /// 取得中(どちらかでも未着)か
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 /// リアクションピッカーの開閉状態(検索クエリを保持)
@@ -212,10 +250,13 @@ impl NmnlApp {
         // 画像ローダー: デコーダは egui_extras、URI→バイトは自前のディスクキャッシュ
         // 付きローダー(F-08-2)。bytes loader は後から登録したものが先に試される
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        cc.egui_ctx
-            .add_bytes_loader(Arc::new(crate::image_loader::CachedImageLoader::new(
-                runtime.handle().clone(),
-            )));
+        let image_loader = Arc::new(crate::image_loader::CachedImageLoader::new(
+            runtime.handle().clone(),
+        ));
+        cc.egui_ctx.add_bytes_loader(image_loader.clone());
+
+        // トレイ常駐(F-09-4)。メニューは「表示」「終了」
+        let (tray, tray_show_id, tray_quit_id) = build_tray();
 
         let deck = ColumnDeck::from_specs(config.columns.clone());
 
@@ -247,6 +288,16 @@ impl NmnlApp {
             emoji_list: emoji::load_emoji_list(),
             reaction_picker: None,
             notice: None,
+            viewer: None,
+            profile: None,
+            settings_win: false,
+            cache_sizes: (0, 0),
+            image_loader: Some(image_loader),
+            tray,
+            tray_show_id,
+            tray_quit_id,
+            hidden_to_tray: false,
+            startup_logged: false,
         };
 
         match config::token::resolve_token(config::HOST) {
@@ -941,7 +992,90 @@ impl NmnlApp {
                 // 自分のリアクションは取り消し、それ以外は同じ絵文字で付与
                 self.spawn_reaction(note_id, reaction, !mine, ctx);
             }
+            // Phase 8: ビューア・プロフィール・設定
+            UiOp::OpenViewer { files, index } => {
+                self.viewer = Some(ui::ViewerState { files, index });
+            }
+            UiOp::CloseViewer => {
+                self.viewer = None;
+            }
+            UiOp::ViewerStep(d) => {
+                if let Some(v) = &mut self.viewer {
+                    v.step(d);
+                }
+            }
+            UiOp::OpenProfile { user_id } => {
+                self.profile = Some(ProfileState {
+                    user_id: user_id.clone(),
+                    loading: true,
+                    ..Default::default()
+                });
+                self.spawn_profile(&user_id, ctx);
+            }
+            UiOp::CloseProfile => {
+                self.profile = None;
+            }
+            UiOp::OpenSettings => {
+                self.settings_win = true;
+                self.refresh_cache_sizes();
+            }
+            UiOp::CloseSettings => {
+                self.settings_win = false;
+            }
+            UiOp::ClearCache(images) => {
+                if images {
+                    if let Some(l) = &self.image_loader {
+                        l.clear_all();
+                    }
+                    self.notice = Some("画像キャッシュを消去しました".to_owned());
+                } else {
+                    emoji::clear_emoji_list();
+                    self.emoji_list.clear();
+                    self.notice = Some("絵文字一覧キャッシュを消去しました".to_owned());
+                }
+                self.refresh_cache_sizes();
+            }
         }
+    }
+
+    /// プロフィール取得(F-05-6)。users/show と users/notes をまとめて取る
+    fn spawn_profile(&self, user_id: &str, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        let user_id = user_id.to_owned();
+        self.runtime.spawn(async move {
+            let user = client
+                .show_user(&api::UserQuery::ById(user_id.clone()))
+                .await
+                .map(Box::new)
+                .map_err(|e| e.to_string());
+            let notes = client
+                .user_notes(
+                    &user_id,
+                    &Paging {
+                        limit: 20,
+                        until_id: None,
+                        since_id: None,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ProfileResult { user, notes });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// キャッシュサイズの再計測(設定画面を開く/消去したときだけ走る)
+    fn refresh_cache_sizes(&mut self) {
+        let img = self
+            .image_loader
+            .as_ref()
+            .map(|l| l.cache_bytes())
+            .unwrap_or(0);
+        self.cache_sizes = (img, emoji::emoji_list_bytes());
     }
 
     fn handle_event(&mut self, ev: AppEvent, ctx: &egui::Context) {
@@ -951,7 +1085,9 @@ impl NmnlApp {
                 came_from_keyring,
             } => match result {
                 Ok(user) => {
-                    self.auth = AuthState::Authenticated { user };
+                    self.auth = AuthState::Authenticated {
+                        user: Box::new(user),
+                    };
                 }
                 Err(e) => {
                     if e.is_auth_failure() {
@@ -978,7 +1114,9 @@ impl NmnlApp {
                         self.token_persisted = config::token::persist_token(config::HOST, &token);
                         self.token_from_env = false;
                         self.token = Some(token);
-                        self.auth = AuthState::Authenticated { user };
+                        self.auth = AuthState::Authenticated {
+                            user: Box::new(user),
+                        };
                     }
                     Err(msg) => {
                         self.auth = AuthState::LoginNeeded {
@@ -1218,6 +1356,23 @@ impl NmnlApp {
                     self.notice = Some(format!("リアクション失敗: {e}"));
                 }
             },
+            AppEvent::ProfileResult { user, notes } => {
+                if let Some(p) = &mut self.profile {
+                    p.loading = false;
+                    match user {
+                        Ok(u) => p.user = Some(*u),
+                        Err(e) => p.error = Some(format!("プロフィール取得失敗: {e}")),
+                    }
+                    match notes {
+                        Ok(ns) => p.notes = ns,
+                        Err(e) => {
+                            if p.error.is_none() {
+                                p.error = Some(format!("ノート取得失敗: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
             AppEvent::EmojiListResult { result } => {
                 if let Ok(list) = result {
                     emoji::save_emoji_list(&list);
@@ -1368,6 +1523,13 @@ async fn fetch_backfill_impl(
 
 impl eframe::App for NmnlApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // N-01: 起動から最初のフレーム描画までを一度だけ記録
+        if !self.startup_logged {
+            self.startup_logged = true;
+            if let Some(t) = crate::STARTED_AT.get() {
+                eprintln!("起動時間(最初のフレームまで): {:?}", t.elapsed());
+            }
+        }
         while let Ok(ev) = self.rx.try_recv() {
             self.handle_event(ev, ctx);
         }
@@ -1382,11 +1544,54 @@ impl eframe::App for NmnlApp {
             self.config.window.height = size.y;
         }
 
+        // トレイ常駐(F-09-4): 最小化を検出して非表示化し、トレイ側の
+        // クリック/メニューで復帰する。トレイ無しの環境では何もしない
+        if self.tray.is_some() {
+            if !self.hidden_to_tray && ctx.input(|i| i.viewport().minimized) == Some(true) {
+                self.hidden_to_tray = true;
+                ctx.send_viewport_cmd(egui::viewport::ViewportCommand::Visible(false));
+            }
+            // トレイ非表示のデスクトップでもタスクバー等から復帰できるよう、
+            // 最小化が外部から解除されたらトレイ待機も解除する
+            if self.hidden_to_tray && ctx.input(|i| i.viewport().minimized) == Some(false) {
+                self.hidden_to_tray = false;
+                ctx.send_viewport_cmd(egui::viewport::ViewportCommand::Visible(true));
+            }
+            let mut restore = false;
+            let mut quit = false;
+            for ev in tray_icon::TrayIconEvent::receiver().try_iter() {
+                if matches!(ev, tray_icon::TrayIconEvent::Click { .. }) {
+                    restore = true;
+                }
+            }
+            for ev in tray_icon::menu::MenuEvent::receiver().try_iter() {
+                if ev.id == self.tray_show_id {
+                    restore = true;
+                } else if ev.id == self.tray_quit_id {
+                    quit = true;
+                }
+            }
+            if restore && self.hidden_to_tray {
+                self.hidden_to_tray = false;
+                ctx.send_viewport_cmd(egui::viewport::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::viewport::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::viewport::ViewportCommand::Focus);
+            }
+            if quit {
+                ctx.send_viewport_cmd(egui::viewport::ViewportCommand::Close);
+            }
+            // 隠れている間はイベントが来ないので、低頻度で repaint して
+            // トレイイベントを拾い続ける
+            if self.hidden_to_tray {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+
         // 認証済みならデッキ、未認証なら認証 UI を出す
         let authed = matches!(self.auth, AuthState::Authenticated { .. });
         if authed {
             let me = match &self.auth {
-                AuthState::Authenticated { user } => Some(user),
+                AuthState::Authenticated { user } => Some(user.as_ref()),
                 _ => None,
             };
             let mut ops = Vec::new();
@@ -1405,6 +1610,10 @@ impl eframe::App for NmnlApp {
                     emoji_list: &self.emoji_list,
                     reaction_picker: &mut self.reaction_picker,
                     notice: &mut self.notice,
+                    viewer: &mut self.viewer,
+                    profile: &mut self.profile,
+                    settings_win: &mut self.settings_win,
+                    cache_sizes: self.cache_sizes,
                 };
                 ui::deck_ui(ctx, &mut self.deck, &mut ui_ctx);
             }
@@ -1496,4 +1705,63 @@ impl eframe::App for NmnlApp {
             stream.shutdown();
         }
     }
+}
+
+/// トレイアイコンとメニューの構築(F-09-4)。
+/// 失敗した環境(システムトレイ非対応など)では None を返して通常動作に落ちる
+fn build_tray() -> (
+    Option<tray_icon::TrayIcon>,
+    tray_icon::menu::MenuId,
+    tray_icon::menu::MenuId,
+) {
+    use tray_icon::menu::{Menu, MenuItem};
+    // Linux では tray-icon が GTK メニューを使うため先に初期化が必要。
+    // 初期化に失敗する環境(wayland 純粋環境など)ではトレイ無しで動かす
+    #[cfg(target_os = "linux")]
+    if gtk::init().is_err() {
+        eprintln!("GTK の初期化に失敗したためトレイは無効です");
+        return (
+            None,
+            tray_icon::menu::MenuId::new("show"),
+            tray_icon::menu::MenuId::new("quit"),
+        );
+    }
+    let menu = Menu::new();
+    let show_item = MenuItem::new("表示", true, None);
+    let quit_item = MenuItem::new("終了", true, None);
+    let _ = menu.append(&show_item);
+    let _ = menu.append(&quit_item);
+    // 32x32 のプログラム生成アイコン(単色の丸)。外部アセットを増やさない
+    let rgba = tray_icon_pixels();
+    let icon = tray_icon::Icon::from_rgba(rgba, 32, 32).ok();
+    let tray = icon.and_then(|icon| {
+        tray_icon::TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("NMNL-browser")
+            .with_icon(icon)
+            .build()
+            .map_err(|e| eprintln!("トレイアイコンの構築に失敗: {e}"))
+            .ok()
+    });
+    (tray, show_item.id().clone(), quit_item.id().clone())
+}
+
+/// トレイ用の 32x32 RGBA を生成する(ミスキー系の緑で円を描く)
+fn tray_icon_pixels() -> Vec<u8> {
+    let mut px = vec![0u8; 32 * 32 * 4];
+    let c = 16.0f32;
+    for y in 0..32u32 {
+        for x in 0..32u32 {
+            let dx = x as f32 - c + 0.5;
+            let dy = y as f32 - c + 0.5;
+            if dx * dx + dy * dy <= 14.0 * 14.0 {
+                let i = ((y * 32 + x) * 4) as usize;
+                px[i] = 0x4a;
+                px[i + 1] = 0xc5;
+                px[i + 2] = 0x7a;
+                px[i + 3] = 0xff;
+            }
+        }
+    }
+    px
 }

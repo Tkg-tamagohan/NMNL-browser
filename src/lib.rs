@@ -13,3 +13,7 @@ pub mod image_loader;
 pub mod model;
 pub mod streaming;
 pub mod ui;
+
+/// 起動時間計測の起点(N-01)。main がプロセス開始直後に set し、
+/// 最初のフレームで経過をログに出す
+pub static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

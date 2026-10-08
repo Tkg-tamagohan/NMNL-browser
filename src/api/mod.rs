@@ -354,6 +354,13 @@ impl ApiClient {
         self.post("users/show", &user_show_body(query)).await
     }
 
+    /// `POST /api/users/notes`: プロフィールに出すそのユーザーのノート一覧(F-05-6)
+    pub async fn user_notes(&self, user_id: &str, paging: &Paging) -> Result<Vec<Note>, ApiError> {
+        let mut body = serde_json::json!({ "userId": user_id, "limit": paging.limit });
+        insert_opt(&mut body, "untilId", &paging.until_id);
+        self.post("users/notes", &body).await
+    }
+
     /// `POST /api/channels/search`: チャンネル検索(F-03-7 の選択 UI 用)
     pub async fn search_channels(
         &self,
@@ -1381,5 +1388,60 @@ mod tests {
         assert!(files[1].uploaded_id.is_none());
         ok.assert_async().await;
         ng.assert_async().await;
+    }
+
+    // PRF-01: users/show の詳細応答(F-05-6)。プロフィールだけに返る
+    // カウンタ・説明を Option フィールドとして受け、軽量ユーザーにも欠落耐性を持つ
+    #[test]
+    fn prf01_user_show_detail_decode() {
+        let mut u = fixture_user();
+        u["description"] = serde_json::json!("紹介文");
+        u["notesCount"] = serde_json::json!(29347);
+        u["followingCount"] = serde_json::json!(120);
+        u["followersCount"] = serde_json::json!(456);
+        u["createdAt"] = serde_json::json!("2020-01-01T00:00:00.000Z");
+        let user: User = serde_json::from_value(u).unwrap();
+        assert_eq!(user.description.as_deref(), Some("紹介文"));
+        assert_eq!(user.notes_count, Some(29347));
+        assert_eq!(user.following_count, Some(120));
+        assert_eq!(user.followers_count, Some(456));
+
+        // ノート埋め込みの軽量ユーザーでは全て None
+        let lite: User = serde_json::from_value(fixture_user()).unwrap();
+        assert!(lite.description.is_none());
+        assert!(lite.notes_count.is_none());
+    }
+
+    // PRF-02: users/notes のリクエスト生成と応答デコード(F-05-6、実経路)
+    #[tokio::test]
+    async fn prf02_user_notes() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/users/notes")
+                    .body_includes("\"userId\":\"u1\"")
+                    .body_includes("\"untilId\":\"old\"");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!([fixture_note("n1"), fixture_note("n2")]));
+            })
+            .await;
+        let client =
+            ApiClient::for_test(format!("{}/api", server.base_url()), Some("tok".to_owned()));
+        let notes = client
+            .user_notes(
+                "u1",
+                &Paging {
+                    limit: 20,
+                    until_id: Some("old".to_owned()),
+                    since_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 2);
+        m.assert_async().await;
     }
 }

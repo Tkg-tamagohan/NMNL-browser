@@ -134,6 +134,20 @@ impl CachedImageLoader {
         let _ = std::fs::create_dir_all(&self.cache_dir);
     }
 
+    /// ディスクキャッシュの現在サイズ(設定画面の表示用、F-09-3)
+    pub fn cache_bytes(&self) -> u64 {
+        std::fs::read_dir(&self.cache_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
     /// キャッシュキーは sha256 の 16 進。衝突耐性と安定性のため固定ハッシュを使う
     fn cache_key(uri: &str) -> String {
         let digest = sha2::Sha256::digest(uri.as_bytes());
@@ -267,6 +281,10 @@ impl BytesLoader for CachedImageLoader {
         let ctx = ctx.clone();
         self.runtime.spawn(async move {
             let result = load_uri(client, cache_dir, &uri_owned, &path).await;
+            // 失敗はメモリキャッシュに残って再試しないので、原因をログに残す
+            if let Entry::Failed(msg) = &result {
+                eprintln!("[image] 取得失敗: {uri_owned} -> {msg}");
+            }
             cache.lock().insert(uri_owned, result);
             ctx.request_repaint();
         });

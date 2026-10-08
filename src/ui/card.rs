@@ -128,7 +128,7 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
     }
 }
 
-fn display_name(user: &crate::model::User) -> String {
+pub fn display_name(user: &crate::model::User) -> String {
     user.name.clone().unwrap_or_else(|| user.username.clone())
 }
 
@@ -146,19 +146,27 @@ fn body(
     // ヘッダ: アバター + 名前 + @id@host + 時刻
     ui.horizontal(|ui| {
         let avatar_size = vec2(28.0, 28.0);
-        match &note.user.avatar_url {
-            Some(url) => {
-                ui.add(
+        // アバターはクリックでプロフィール(F-05-6)
+        let avatar_resp = match &note.user.avatar_url {
+            Some(url) => ui
+                .add(
                     egui::Image::new(url)
                         .fit_to_exact_size(avatar_size)
                         .corner_radius(4.0),
-                );
-            }
+                )
+                .interact(Sense::click()),
             None => {
-                let (rect, _) = ui.allocate_exact_size(avatar_size, Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(avatar_size, Sense::click());
                 ui.painter()
                     .rect_filled(rect, 4.0, Color32::from_rgb(0x44, 0x48, 0x55));
+                resp
             }
+        };
+        ctx.card_state.click_exclusions.push(avatar_resp.rect);
+        if avatar_resp.clicked() {
+            ctx.ops.push(UiOp::OpenProfile {
+                user_id: note.user.id.clone(),
+            });
         }
         // 時刻用の幅を先に差し引いて名前の縦積みへ渡す。
         // ui.horizontal の子は残幅を全部使うので、vertical が右端まで埋めると
@@ -168,7 +176,7 @@ fn body(
         let name_w = (ui.available_width() - TIME_SLOT_W).max(60.0);
         let name_rect =
             egui::Rect::from_min_size(ui.cursor().min, vec2(name_w, ui.available_height()));
-        ui.scope_builder(
+        let name_scope = ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(name_rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
@@ -208,6 +216,18 @@ fn body(
                 });
             },
         );
+        // 名前の縦積みブロックもクリックでプロフィール(F-05-6)
+        let name_resp = ui.interact(
+            name_scope.response.rect,
+            egui::Id::new(("profile_click", &note.id)),
+            Sense::click(),
+        );
+        ctx.card_state.click_exclusions.push(name_resp.rect);
+        if name_resp.clicked() {
+            ctx.ops.push(UiOp::OpenProfile {
+                user_id: note.user.id.clone(),
+            });
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
             ui.label(
                 RichText::new(fmt_time(&note.created_at))
@@ -354,10 +374,20 @@ fn media_row(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, _col_id: u64) {
     }
     let avail = ui.available_width();
     let thumb_w = ((avail - 4.0) / 2.0).clamp(120.0, avail);
+    // ビューア用にノート内の画像一覧を先に集める(F-08-1)
+    let images: Vec<DriveFile> = note
+        .files
+        .iter()
+        .filter(|f| media_kind(f) == MediaKind::Image)
+        .cloned()
+        .collect();
     ui.horizontal_wrapped(|ui| {
         for file in &note.files {
             match media_kind(file) {
-                MediaKind::Image => image_thumb(ui, file, thumb_w, ctx),
+                MediaKind::Image => {
+                    let idx = images.iter().position(|f| f.id == file.id).unwrap_or(0);
+                    image_thumb(ui, file, &images, idx, thumb_w, ctx);
+                }
                 MediaKind::Video | MediaKind::Audio | MediaKind::Other => {
                     // F-08-3: 動画・音声は外部ブラウザで開く(再生しない)
                     let icon = if file.file_type.starts_with("video/") {
@@ -379,8 +409,16 @@ fn media_row(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, _col_id: u64) {
     });
 }
 
-/// 画像サムネイル(F-08-1/-2)。センシティブはクリックで展開(F-08-4)
-fn image_thumb(ui: &mut Ui, file: &DriveFile, w: f32, ctx: &mut UiCtx<'_>) {
+/// 画像サムネイル(F-08-1/-2)。センシティブはクリックで展開(F-08-4)。
+/// 非センシティブのクリックはアプリ内ビューア(F-08-1)を開く
+fn image_thumb(
+    ui: &mut Ui,
+    file: &DriveFile,
+    images: &[DriveFile],
+    index: usize,
+    w: f32,
+    ctx: &mut UiCtx<'_>,
+) {
     let opened = ctx.card_state.media_open.contains(&file.id);
     if file.is_sensitive && !opened {
         let label = format!("⚠ 閲覧注意: {}", file.name);
@@ -400,15 +438,16 @@ fn image_thumb(ui: &mut Ui, file: &DriveFile, w: f32, ctx: &mut UiCtx<'_>) {
     }
     let src = file.thumbnail_url.as_deref().or(file.url.as_deref());
     if let Some(src) = src {
-        // クリックで拡大ビュー(F-08-5)は Phase 8。現段階では原寸を外部で開く
+        // クリックで拡大ビューア(F-08-1)
         let resp = ui
             .add(egui::Image::new(src).max_width(w).corner_radius(4.0))
             .interact(Sense::click());
         ctx.card_state.click_exclusions.push(resp.rect);
-        if resp.clicked()
-            && let Some(u) = &file.url
-        {
-            ctx.ops.push(UiOp::OpenUrl(u.clone()));
+        if resp.clicked() {
+            ctx.ops.push(UiOp::OpenViewer {
+                files: images.to_vec(),
+                index,
+            });
         }
     }
 }
