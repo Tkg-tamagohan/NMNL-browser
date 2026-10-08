@@ -1117,7 +1117,7 @@ fn conversation_body(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
         });
 }
 
-/// メインカラム(F-06 の投稿欄は Phase 7)。現段階はユーザー情報と状態表示
+/// メインカラム。ユーザー情報と投稿フォーム(F-06-5)を表示する
 fn main_body(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
     if let Some(me) = ctx.me {
         ui.add_space(8.0);

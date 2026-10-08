@@ -338,7 +338,7 @@ impl ApiClient {
     }
 
     /// `POST /api/i/notifications`: 通知一覧(F-04-1)
-    /// io での応答形(グルーピングの有無など)は要実データ検証(Phase 6)
+    /// 通知カラムの表示で io の実データ確認済み(Phase 6)
     pub async fn notifications(
         &self,
         paging: &Paging,
@@ -515,7 +515,7 @@ fn timeline_endpoint(kind: TimelineKind) -> &'static str {
 
 /// タイムライン系リクエストのボディを組み立てる(F-03-3、F-03-4)。
 /// io 実測: `withFiles`、`withRenotes` は効くが `withReplies:false` は LTL で無視される挙動。
-/// 返信フィルタはクライアント側での最終フィルタを併用する(Phase 6 で検証)
+/// 返信フィルタはクライアント側での最終フィルタを併用する(Phase 6 で検証済み)
 fn timeline_body(paging: &Paging, filters: &ColumnFilters) -> serde_json::Value {
     let mut body = serde_json::json!({
         "limit": paging.limit,
@@ -804,7 +804,7 @@ mod tests {
         assert!(body2.get("includeTypes").is_none());
         assert!(body2.get("excludeTypes").is_none());
 
-        // 応答デコード(本家の既知形。io 実測は認証後の Phase 6 で検証)
+        // 応答デコード(io の実データ確認済み)
         let notif = serde_json::json!({
             "id": "ntf1", "createdAt": "2026-10-07T12:00:00.000Z",
             "type": "reaction", "isRead": false,
