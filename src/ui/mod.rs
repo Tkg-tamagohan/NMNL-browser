@@ -40,15 +40,18 @@ pub enum UiOp {
     /// 外部ブラウザで開く(F-08-3 など)
     OpenUrl(String),
     // Phase 7: 投稿と操作(F-06/F-07)
-    /// 返信対象のセット(投稿フォームへ。引用と相互排他)
+    /// 返信対象のセット(投稿フォームへ。引用と相互排他)。
+    /// 対象がチャンネル所属なら channelId を継承する(仕様決定 W)
     ReplyTo {
         id: String,
         label: String,
+        channel: Option<crate::model::NoteChannel>,
     },
     /// 引用対象のセット
     Quote {
         id: String,
         label: String,
+        channel: Option<crate::model::NoteChannel>,
     },
     /// 対象の解除(true=返信、false=引用)
     ClearTarget(bool),
@@ -56,8 +59,23 @@ pub enum UiOp {
     PostNote,
     /// 添付の取り外し(インデックス)
     RemoveAttachment(usize),
-    /// 即時リノート(F-06)
-    Renote(String),
+    /// 即時リノート(F-06)。対象がチャンネル所属なら channelId を継承する
+    Renote {
+        note_id: String,
+        channel: Option<crate::model::NoteChannel>,
+    },
+    /// 投稿フォームのチャンネル選択 UI の開閉(F-06-4)
+    ComposerChannelPickerOpen,
+    /// フォーム側チャンネル検索のクエリ変更(F-06-4)
+    ComposerChannelPickerQuery(String),
+    /// フォームの投稿先チャンネルを設定/解除する(F-06-4)。
+    /// Some((id, name)) でチャンネル投稿、None で通常投稿へ戻す
+    ComposerSetChannel(Option<(String, String)>),
+    /// channel カラムの「このチャンネルに投稿」導線(F-06-4・仕様決定 V)
+    PostToChannel {
+        channel_id: String,
+        name: Option<String>,
+    },
     /// リアクションピッカーの開閉(F-07-2)
     OpenReactionPicker(String),
     CloseReactionPicker,
@@ -103,6 +121,8 @@ pub enum UiOp {
     CloseSettings,
     /// キャッシュの消去(F-09-3)。true=画像、false=絵文字一覧
     ClearCache(bool),
+    /// UI スケール(文字サイズ)の変更(F-09-5)
+    SetUiScale(f32),
 }
 
 /// 描画に必要なアプリ状態の参照まとめ
@@ -138,6 +158,12 @@ pub struct UiCtx<'a> {
     pub settings_win: &'a mut bool,
     /// キャッシュの現在サイズ(画像バイト, 絵文字一覧バイト)。設定画面表示用
     pub cache_sizes: (u64, u64),
+    /// 投稿フォームのチャンネル選択 UI 状態(F-06-4)
+    pub composer_channel_picker: &'a mut crate::deck::ChannelPicker,
+    /// フォーム側チャンネル選択ポップアップの開閉
+    pub composer_channel_open: &'a mut bool,
+    /// 現在の UI スケール(F-09-5、設定画面のスライダー表示用)
+    pub ui_scale: f32,
 }
 
 /// 画像ビューアの状態(F-08-1)
@@ -182,9 +208,14 @@ pub fn deck_ui(ctx: &egui::Context, deck: &mut ColumnDeck, ui_ctx: &mut UiCtx<'_
     egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
         top_bar(ui, ui_ctx);
     });
-    egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
-        composer_panel(ui, ui_ctx);
-    });
+    // 投稿フォームはメインカラム内に表示する(F-06-5、仕様決定 X)。
+    // メインカラムが未配置のときだけ、投稿経路を残すために
+    // ボトムパネルのフォームを自動表示する
+    if !deck.has_main_column() {
+        egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
+            composer_panel(ui, ui_ctx);
+        });
+    }
     reaction_picker_window(ctx, ui_ctx);
     viewer_window(ctx, ui_ctx);
     profile_window(ctx, ui_ctx);
@@ -241,14 +272,16 @@ fn top_bar(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
     });
 }
 
-/// 投稿フォーム(F-06)。常設のボトムパネルで、返信/引用は対象を
-/// セットして同じフォームから投稿する
+/// 投稿フォーム(F-06)。メインカラム内に表示し、メインカラムが
+/// 無いときだけボトムパネルに出す(F-06-5・仕様決定 X)。
+/// 返信/引用は対象をセットして同じフォームから投稿する
 fn composer_panel(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
     use crate::composer::{MAX_ATTACHMENTS, visibility_label};
     // 投稿中は編集を不可にする。成功時にフォーム全体をリセットするため、
     // 送信中の追記がリクエストに含まれないまま消えるのを防ぐ
     ui.add_enabled_ui(!ctx.composer.posting, |ui| {
-        ui.horizontal(|ui| {
+        // カラム幅のメインカラムにも収まるよう折り返しを許可する
+        ui.horizontal_wrapped(|ui| {
             // 返信/引用の対象表示と解除(F-06-3)
             let mut clear_reply = false;
             let mut clear_quote = false;
@@ -275,19 +308,47 @@ fn composer_panel(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
             if ui.checkbox(&mut cw_on, "CW").changed() {
                 ctx.composer.cw_enabled = cw_on;
             }
-            // 公開範囲(F-06-1)
-            egui::ComboBox::from_id_salt("visibility")
-                .selected_text(visibility_label(ctx.composer.visibility))
-                .show_ui(ui, |ui| {
-                    for v in [
-                        crate::model::Visibility::Public,
-                        crate::model::Visibility::Home,
-                        crate::model::Visibility::Followers,
-                        crate::model::Visibility::Specified,
-                    ] {
-                        ui.selectable_value(&mut ctx.composer.visibility, v, visibility_label(v));
+            // 公開範囲(F-06-1)。チャンネル投稿のときはパブリック固定で
+            // 選択不可にする(仕様決定 W・F-06-4)
+            let channel_selected = ctx.composer.channel_id.is_some();
+            ui.add_enabled_ui(!channel_selected, |ui| {
+                egui::ComboBox::from_id_salt("visibility")
+                    .selected_text(visibility_label(ctx.composer.visibility))
+                    .show_ui(ui, |ui| {
+                        for v in [
+                            crate::model::Visibility::Public,
+                            crate::model::Visibility::Home,
+                            crate::model::Visibility::Followers,
+                            crate::model::Visibility::Specified,
+                        ] {
+                            ui.selectable_value(
+                                &mut ctx.composer.visibility,
+                                v,
+                                visibility_label(v),
+                            );
+                        }
+                    });
+            });
+            // 投稿先チャンネル(F-06-4)。選択中は解除用の × を付ける
+            {
+                let ch_label = match (&ctx.composer.channel_id, &ctx.composer.channel_name) {
+                    (Some(_), Some(name)) => format!("📺 {name}"),
+                    (Some(id), None) => format!("📺 {id}"),
+                    _ => "📺 通常投稿".to_owned(),
+                };
+                let resp = ui
+                    .button(RichText::new(ch_label).size(11.0))
+                    .on_hover_text("投稿先チャンネルを選択");
+                if resp.clicked() {
+                    *ctx.composer_channel_open = !*ctx.composer_channel_open;
+                    if *ctx.composer_channel_open {
+                        ctx.ops.push(UiOp::ComposerChannelPickerOpen);
                     }
-                });
+                }
+                if channel_selected && ui.small_button("×").clicked() {
+                    ctx.ops.push(UiOp::ComposerSetChannel(None));
+                }
+            }
             // 添付(D&D、最大 MAX_ATTACHMENTS)
             ui.label(
                 RichText::new("画像をドロップで添付")
@@ -332,6 +393,10 @@ fn composer_panel(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
                 .desired_rows(2)
                 .desired_width(f32::INFINITY),
         );
+        // チャンネル選択ポップアップ(F-06-4)
+        if *ctx.composer_channel_open {
+            composer_channel_picker(ui, ctx);
+        }
         // エラーと通知
         if let Some(e) = &ctx.composer.error {
             ui.label(
@@ -411,8 +476,24 @@ fn reaction_picker_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
     }
 }
 
+/// マウスの戻るボタン(ブラウザの「戻る」相当)がこのフレームで
+/// 押されたか。egui-winit 0.32 は winit の Back→Extra1、
+/// Forward→Extra2 を割り当てる(F-08-6)
+fn back_button_pressed(i: &egui::InputState) -> bool {
+    i.events.iter().any(|e| {
+        matches!(
+            e,
+            egui::Event::PointerButton {
+                button: egui::PointerButton::Extra1,
+                pressed: true,
+                ..
+            }
+        )
+    })
+}
+
 /// 画像ビューア(F-08-1)。サムネイルクリックで開く拡大表示。
-/// ‹› ボタンと ←→ キーでめくり、×/ESC で閉じる
+/// ‹› ボタンと ←→ キーでめくり、×/Esc/戻るボタンで閉じる(F-08-6)
 fn viewer_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
     let Some(state) = ctx.viewer.as_mut() else {
         return;
@@ -429,6 +510,11 @@ fn viewer_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
     }
     if egui_ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
         step = 1;
+    }
+    // F-08-6: Esc キーとマウスの戻るボタンでも閉じる
+    // (egui-winit は winit の Back を Extra1 に写す)
+    if egui_ctx.input(|i| i.key_pressed(egui::Key::Escape) || back_button_pressed(i)) {
+        open = false;
     }
     let total = state.files.len();
     let mut reveal: Option<String> = None;
@@ -616,6 +702,30 @@ fn settings_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
                     ctx.ops.push(UiOp::ClearCache(false));
                 }
             });
+            ui.separator();
+            // 文字サイズ = UI 全体の拡縮(F-09-5・仕様決定 U/T)
+            ui.label(RichText::new("文字サイズ").strong());
+            ui.horizontal(|ui| {
+                let mut scale = ctx.ui_scale;
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut scale,
+                            crate::config::UI_SCALE_MIN..=crate::config::UI_SCALE_MAX,
+                        )
+                        .suffix(" 倍")
+                        .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    ctx.ops.push(UiOp::SetUiScale(scale));
+                }
+            });
+            ui.label(
+                RichText::new("UI 全体の拡縮です。再起動後も保持されます")
+                    .size(10.0)
+                    .color(Color32::GRAY),
+            );
         });
     if !open {
         ctx.ops.push(UiOp::CloseSettings);
@@ -847,6 +957,32 @@ fn timeline_body(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
         }
         return;
     }
+    // F-06-4: channel カラムからの投稿導線(仕様決定 V)
+    if matches!(col.spec.kind, crate::config::ColumnKind::Channel)
+        && let Some(chid) = col.spec.channel_id.clone()
+    {
+        // 表示名はカラム内ノートの埋め込み channel から拾う。未取得のときは
+        // ID をそのまま渡し、フォーム側は ID 表示にフォールバックする
+        let name = match &col.items {
+            ColumnItems::Notes(notes) => notes.iter().find_map(|n| {
+                n.channel
+                    .as_ref()
+                    .filter(|c| c.id == chid)
+                    .and_then(|c| c.name.clone())
+            }),
+            _ => None,
+        };
+        if ui
+            .button(RichText::new("📤 このチャンネルに投稿").size(11.0))
+            .clicked()
+        {
+            ctx.ops.push(UiOp::PostToChannel {
+                channel_id: chid,
+                name,
+            });
+        }
+        ui.separator();
+    }
     let id = col.id;
     let scroll = egui::ScrollArea::vertical()
         .id_salt(("col_scroll", id))
@@ -1005,12 +1141,16 @@ fn main_body(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
             });
         });
         ui.separator();
-        ui.label(
-            RichText::new("投稿欄は Phase 7 で実装予定です")
-                .size(11.0)
-                .color(Color32::DARK_GRAY),
-        );
     }
+    // F-06-5: 投稿フォームはメインカラムに配置する(仕様決定 X)。
+    // スクロール可能にしておき、チャンネル選択一覧が長いときも
+    // ユーザー情報行が押し出されないようにする
+    egui::ScrollArea::vertical()
+        .id_salt("main_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            composer_panel(ui, ctx);
+        });
 }
 
 /// チャンネル選択(F-03-7)。フォロー中一覧 + 検索
@@ -1092,6 +1232,103 @@ fn channel_picker(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
     }
 }
 
+/// 投稿フォームの投稿先チャンネル選択(F-06-4・仕様決定 V)。
+/// 構成はカラムの channel_picker と同じ(フォロー中一覧+検索)で、
+/// 状態と取得はアプリ側の composer 用スロットに置く
+fn composer_channel_picker(ui: &mut Ui, ctx: &mut UiCtx<'_>) {
+    let picker = &mut *ctx.composer_channel_picker;
+    ui.separator();
+    ui.label(RichText::new("投稿先チャンネル").strong().size(11.0));
+    if ui
+        .button(RichText::new("通常投稿(チャンネル指定なし)").size(11.0))
+        .clicked()
+    {
+        ctx.ops.push(UiOp::ComposerSetChannel(None));
+        *ctx.composer_channel_open = false;
+    }
+    let mut q = picker.query.clone();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut q)
+                .hint_text("検索…")
+                .desired_width(f32::INFINITY),
+        )
+        .changed()
+    {
+        ctx.ops.push(UiOp::ComposerChannelPickerQuery(q.clone()));
+        picker.query = q;
+    }
+    // 一覧が長いとフォームが伸びるので高さを抑える
+    egui::ScrollArea::vertical()
+        .id_salt("composer_channel_list")
+        .max_height(200.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if !picker.followed.is_empty() {
+                ui.label(RichText::new("フォロー中").size(10.0).color(Color32::GRAY));
+                let followed = picker.followed.clone();
+                for ch in &followed {
+                    if ui
+                        .add(
+                            egui::Button::new(format!("📺 {}", ch.name))
+                                .wrap()
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        ctx.ops.push(UiOp::ComposerSetChannel(Some((
+                            ch.id.clone(),
+                            ch.name.clone(),
+                        ))));
+                        *ctx.composer_channel_open = false;
+                    }
+                }
+            }
+            if !picker.results.is_empty() {
+                ui.label(RichText::new("検索結果").size(10.0).color(Color32::GRAY));
+                let results = picker.results.clone();
+                for ch in &results {
+                    if ui
+                        .add(
+                            egui::Button::new(format!("📺 {}", ch.name))
+                                .wrap()
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        ctx.ops.push(UiOp::ComposerSetChannel(Some((
+                            ch.id.clone(),
+                            ch.name.clone(),
+                        ))));
+                        *ctx.composer_channel_open = false;
+                    }
+                }
+            }
+            if let Some(err) = &picker.error {
+                let err = err.clone();
+                ui.label(
+                    RichText::new(format!("⚠ {err}"))
+                        .color(Color32::LIGHT_RED)
+                        .size(11.0),
+                );
+            }
+            if picker.loading {
+                ui.label(RichText::new("読み込み中…").size(10.0).color(Color32::GRAY));
+            }
+            if !picker.loading
+                && picker.error.is_none()
+                && picker.followed.is_empty()
+                && picker.results.is_empty()
+            {
+                ui.label(
+                    RichText::new("チャンネルが見つかりませんでした。名前で検索できます")
+                        .size(10.0)
+                        .color(Color32::GRAY),
+                );
+            }
+        });
+}
+
 /// 右端の細いハンドルで幅をドラッグ変更(F-02-1)
 fn resize_handle(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>, _height: f32) {
     let id = col.id;
@@ -1166,6 +1403,50 @@ mod tests {
         let mut e = ViewerState::default();
         e.step(3);
         assert_eq!(e.index, 0);
+    }
+
+    // VWR-03: ビューアは Esc キーとマウスの戻るボタンでも閉じる(F-08-6)。
+    // egui-winit 0.32 は winit の Back→PointerButton::Extra1 を割り当てる
+    // (src/lib.rs の mouse_button 変換で確認)
+    #[test]
+    fn vwr03_esc_and_back_button_close() {
+        let press = |button: egui::PointerButton| egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos: egui::pos2(10.0, 10.0),
+                button,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        // 戻るボタン(Extra1)の押下は検出される
+        let _ = egui::Context::default().run(press(egui::PointerButton::Extra1), |ctx| {
+            assert!(ctx.input(back_button_pressed));
+        });
+        // 進むボタン(Extra2)や通常ボタンでは閉じない
+        for b in [
+            egui::PointerButton::Extra2,
+            egui::PointerButton::Primary,
+            egui::PointerButton::Middle,
+        ] {
+            let _ = egui::Context::default().run(press(b), |ctx| {
+                assert!(!ctx.input(back_button_pressed));
+            });
+        }
+        // Esc キー押下も検出される
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = egui::Context::default().run(raw, |ctx| {
+            assert!(ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+        });
     }
 
     // VWR-02: ビューア内でも未開封の閲覧注意は覆ったまま(F-08-1)

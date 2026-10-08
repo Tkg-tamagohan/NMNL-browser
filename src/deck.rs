@@ -869,6 +869,14 @@ impl ColumnDeck {
         }
         dirty
     }
+
+    /// メインカラムが配置されているか(F-06-5)。投稿フォームは
+    /// メインカラム内に表示し、無いときだけボトムパネルを自動表示する
+    pub fn has_main_column(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| matches!(c.spec.kind, ColumnKind::Main))
+    }
 }
 
 #[cfg(test)]
@@ -1442,6 +1450,23 @@ mod tests {
         let n3 = &notes[0];
         assert_eq!(n3.reactions.get(":cat:"), Some(&2));
         assert_eq!(n3.my_reaction, None);
+    }
+
+    // POST-07: 投稿フォームはメインカラム内に表示し、メインカラムが
+    // 無いときだけボトムパネル側に出す(F-06-5、仕様決定 X)
+    #[test]
+    fn post07_main_column_predicate() {
+        // 既定構成にはメインカラムが含まれる
+        let deck = ColumnDeck::from_specs(crate::config::AppConfig::default().columns);
+        assert!(deck.has_main_column());
+        // メインだけ無い構成では false
+        let mut specs = crate::config::AppConfig::default().columns;
+        specs.retain(|s| !matches!(s.kind, ColumnKind::Main));
+        let deck = ColumnDeck::from_specs(specs);
+        assert!(!deck.has_main_column());
+        // 空デッキでも false(パネル側が投稿経路を引き受ける)
+        let deck = ColumnDeck::from_specs(vec![]);
+        assert!(!deck.has_main_column());
     }
 
     fn col_index(deck: &ColumnDeck, id: u64) -> usize {

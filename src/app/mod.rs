@@ -93,6 +93,14 @@ enum EmojiFetch {
     Transient,
 }
 
+/// チャンネル一覧の取得先。カラムの選択 UI(F-03-7)と
+/// 投稿フォームの投稿先選択(F-06-4)で同じ取得経路を使い分ける
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelListTarget {
+    Column(u64),
+    Composer,
+}
+
 enum AppEvent {
     VerifyResult {
         result: Result<User, api::ApiError>,
@@ -122,14 +130,14 @@ enum AppEvent {
         root: Option<Box<Note>>,
         result: Result<Vec<Note>, String>,
     },
-    /// フォロー中チャンネル一覧(F-03-7)
+    /// フォロー中チャンネル一覧(F-03-7/F-06-4)
     FollowedResult {
-        col_id: u64,
+        target: ChannelListTarget,
         result: Result<Vec<Channel>, String>,
     },
-    /// チャンネル検索結果(F-03-7)
+    /// チャンネル検索結果(F-03-7/F-06-4)
     ChannelSearchResult {
-        col_id: u64,
+        target: ChannelListTarget,
         /// 発行時のクエリ(古いクエリの応答で上書きしない照合に使う)
         query: String,
         result: Result<Vec<Channel>, String>,
@@ -203,6 +211,10 @@ pub struct NmnlApp {
     // Phase 7: 投稿と操作
     /// 投稿フォーム(F-06)
     composer: Composer,
+    /// フォームの投稿先チャンネル選択 UI の状態(F-06-4)
+    composer_channel_picker: crate::deck::ChannelPicker,
+    /// フォーム側チャンネル選択ポップアップの開閉
+    composer_channel_open: bool,
     /// ピッカー用の絵文字一覧(F-07-3)。起動時にディスクキャッシュから
     /// 先読みし、認証後に最新を取って上書きする
     emoji_list: Vec<Emoji>,
@@ -302,6 +314,8 @@ impl NmnlApp {
             resize_base: None,
             add_kind: AddableKind::Timeline(config::TimelineKind::Home),
             composer: Composer::default(),
+            composer_channel_picker: crate::deck::ChannelPicker::default(),
+            composer_channel_open: false,
             // F-07-3: 前回取得した一覧があれば即表示できるよう先読みする
             emoji_list: emoji::load_emoji_list(),
             reaction_picker: None,
@@ -317,6 +331,9 @@ impl NmnlApp {
             hidden_to_tray: false,
             startup_logged: false,
         };
+
+        // 文字サイズ(F-09-5): UI 全体の拡縮として zoom_factor に適用する
+        cc.egui_ctx.set_zoom_factor(app.config.ui_scale);
 
         match config::token::resolve_token(config::HOST) {
             config::token::TokenResolution::Found { token, source } => {
@@ -700,8 +717,8 @@ impl NmnlApp {
         });
     }
 
-    /// フォロー中チャンネル一覧(F-03-7)
-    fn spawn_followed_channels(&self, col_id: u64, ctx: &egui::Context) {
+    /// フォロー中チャンネル一覧(F-03-7/F-06-4)
+    fn spawn_followed_channels(&self, target: ChannelListTarget, ctx: &egui::Context) {
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -715,13 +732,13 @@ impl NmnlApp {
                 })
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::FollowedResult { col_id, result });
+            let _ = tx.send(AppEvent::FollowedResult { target, result });
             ctx2.request_repaint();
         });
     }
 
-    /// チャンネル検索(F-03-7)
-    fn spawn_channel_search(&self, col_id: u64, query: String, ctx: &egui::Context) {
+    /// チャンネル検索(F-03-7/F-06-4)
+    fn spawn_channel_search(&self, target: ChannelListTarget, query: String, ctx: &egui::Context) {
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -733,12 +750,28 @@ impl NmnlApp {
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::ChannelSearchResult {
-                col_id,
+                target,
                 query,
                 result,
             });
             ctx2.request_repaint();
         });
+    }
+
+    /// ChannelListTarget に対応する ChannelPicker 状態への参照
+    fn channel_picker_of(
+        &mut self,
+        target: ChannelListTarget,
+    ) -> Option<&mut crate::deck::ChannelPicker> {
+        match target {
+            ChannelListTarget::Column(id) => self
+                .deck
+                .columns
+                .iter_mut()
+                .find(|c| c.id == id)
+                .and_then(|c| c.channel_picker.as_mut()),
+            ChannelListTarget::Composer => Some(&mut self.composer_channel_picker),
+        }
     }
 
     /// 絵文字のオンデマンド取得(F-05-2)
@@ -936,11 +969,11 @@ impl NmnlApp {
                     })
                     .unwrap_or(false);
                 if need {
-                    self.spawn_followed_channels(id, ctx);
+                    self.spawn_followed_channels(ChannelListTarget::Column(id), ctx);
                 }
                 // 開いた時点で初期一覧を出す(io は query:"" でチャンネル一覧が返る。
                 // フォロー中が空でも検索なしで選べるようにする)
-                self.spawn_channel_search(id, String::new(), ctx);
+                self.spawn_channel_search(ChannelListTarget::Column(id), String::new(), ctx);
             }
             UiOp::ChannelPickerQuery(id, q) => {
                 if let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == id) {
@@ -951,20 +984,57 @@ impl NmnlApp {
                     // 残さないよう空でも検索を再発行して表示を揃える
                     picker.results.clear();
                 }
-                self.spawn_channel_search(id, q, ctx);
+                self.spawn_channel_search(ChannelListTarget::Column(id), q, ctx);
+            }
+            // Phase 11: フォーム側のチャンネル選択(F-06-4)
+            UiOp::ComposerChannelPickerOpen => {
+                let need = {
+                    let picker = &mut self.composer_channel_picker;
+                    if !picker.followed_loaded {
+                        picker.loading = true;
+                        picker.followed_loaded = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if need {
+                    self.spawn_followed_channels(ChannelListTarget::Composer, ctx);
+                }
+                self.spawn_channel_search(ChannelListTarget::Composer, String::new(), ctx);
+            }
+            UiOp::ComposerChannelPickerQuery(q) => {
+                {
+                    let picker = &mut self.composer_channel_picker;
+                    picker.query = q.clone();
+                    picker.loading = true;
+                    picker.results.clear();
+                }
+                self.spawn_channel_search(ChannelListTarget::Composer, q, ctx);
+            }
+            UiOp::ComposerSetChannel(sel) => match sel {
+                Some((id, name)) => self.composer.set_channel(Some(id), Some(name)),
+                None => self.composer.set_channel(None, None),
+            },
+            // channel カラムの「このチャンネルに投稿」導線(仕様決定 V)
+            UiOp::PostToChannel { channel_id, name } => {
+                self.composer.set_channel(Some(channel_id), name);
             }
             UiOp::OpenUrl(u) => {
                 let _ = open::that(&u);
             }
             // Phase 7: 投稿と操作
-            UiOp::ReplyTo { id, label } => {
+            UiOp::ReplyTo { id, label, channel } => {
                 // 返信と引用は相互排他(本文中に両方参照は作れない)
                 self.composer.quote_of = None;
                 self.composer.reply_to = Some(crate::composer::PostTarget { id, label });
+                // 対象がチャンネル所属なら投稿も同じチャンネルへ(仕様決定 W)
+                self.composer.inherit_channel(channel.as_ref());
             }
-            UiOp::Quote { id, label } => {
+            UiOp::Quote { id, label, channel } => {
                 self.composer.reply_to = None;
                 self.composer.quote_of = Some(crate::composer::PostTarget { id, label });
+                self.composer.inherit_channel(channel.as_ref());
             }
             UiOp::ClearTarget(reply) => {
                 if reply {
@@ -998,12 +1068,10 @@ impl NmnlApp {
                     self.composer.files.remove(i);
                 }
             }
-            UiOp::Renote(note_id) => {
-                // リノートはフォームを通さず即時投稿(仕様決定 E)
-                let req = CreateNote {
-                    renote_id: Some(note_id),
-                    ..Default::default()
-                };
+            UiOp::Renote { note_id, channel } => {
+                // リノートはフォームを通さず即時投稿(仕様決定 E)。
+                // 対象がチャンネル所属なら channelId を継承する(仕様決定 W)
+                let req = crate::composer::renote_request(&note_id, channel.as_ref());
                 self.spawn_post(req, Vec::new(), false, ctx);
             }
             UiOp::OpenReactionPicker(note_id) => {
@@ -1087,6 +1155,14 @@ impl NmnlApp {
             }
             UiOp::CloseSettings => {
                 self.settings_win = false;
+            }
+            UiOp::SetUiScale(v) => {
+                // F-09-5: UI 全体の拡縮を zoom_factor へ反映し設定へ保存
+                self.config.ui_scale = crate::config::normalize_ui_scale(v);
+                ctx.set_zoom_factor(self.config.ui_scale);
+                if let Err(e) = self.config.save() {
+                    eprintln!("設定の保存に失敗しました: {e}");
+                }
             }
             UiOp::ClearCache(images) => {
                 if images {
@@ -1338,11 +1414,8 @@ impl NmnlApp {
                     }
                 }
             }
-            AppEvent::FollowedResult { col_id, result } => {
-                let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
-                    return;
-                };
-                let Some(picker) = col.channel_picker.as_mut() else {
+            AppEvent::FollowedResult { target, result } => {
+                let Some(picker) = self.channel_picker_of(target) else {
                     return;
                 };
                 picker.loading = false;
@@ -1359,14 +1432,11 @@ impl NmnlApp {
                 }
             }
             AppEvent::ChannelSearchResult {
-                col_id,
+                target,
                 query,
                 result,
             } => {
-                let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
-                    return;
-                };
-                let Some(picker) = col.channel_picker.as_mut() else {
+                let Some(picker) = self.channel_picker_of(target) else {
                     return;
                 };
                 // 古いクエリの応答が遅れて届いた場合は現在の検索結果を上書きしない
@@ -1627,8 +1697,11 @@ impl eframe::App for NmnlApp {
         if matches!(self.auth, AuthState::Authenticated { .. }) {
             self.bootstrap_streaming(ctx);
         }
-        // ウィンドウサイズを設定に反映しておく(終了時に保存)
-        let size = ctx.input(|i| i.screen_rect().size());
+        // ウィンドウサイズを設定に反映しておく(終了時に保存)。
+        // screen_rect は zoom 適用後の egui ポイントなので、保存値は
+        // zoom_factor を掛けてネイティブ論理サイズに戻す
+        // (そのまま保存すると再起動のたびにサイズがずれる)
+        let size = ctx.input(|i| i.screen_rect().size()) * ctx.zoom_factor();
         if size.x > 0.0 && size.y > 0.0 {
             self.config.window.width = size.x;
             self.config.window.height = size.y;
@@ -1704,6 +1777,9 @@ impl eframe::App for NmnlApp {
                     profile: &mut self.profile,
                     settings_win: &mut self.settings_win,
                     cache_sizes: self.cache_sizes,
+                    composer_channel_picker: &mut self.composer_channel_picker,
+                    composer_channel_open: &mut self.composer_channel_open,
+                    ui_scale: self.config.ui_scale,
                 };
                 ui::deck_ui(ctx, &mut self.deck, &mut ui_ctx);
             }
