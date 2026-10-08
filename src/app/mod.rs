@@ -83,7 +83,16 @@ enum FetchResult {
     Notifications(Vec<Notification>),
 }
 
+/// 絵文字個別取得の結果(F-05-2)。一時失敗は否定キャッシュせず再試行する
 #[derive(Debug)]
+enum EmojiFetch {
+    Found(String),
+    /// サーバーが「存在しない」と答えた(否定キャッシュする)
+    Missing,
+    /// 429・通信失敗など再試行可能な失敗
+    Transient,
+}
+
 enum AppEvent {
     VerifyResult {
         result: Result<User, api::ApiError>,
@@ -126,7 +135,7 @@ enum AppEvent {
         result: Result<Vec<Channel>, String>,
     },
     /// 絵文字のオンデマンド解決結果(F-05-2)
-    EmojiResult { name: String, url: Option<String> },
+    EmojiResult { name: String, outcome: EmojiFetch },
     /// 投稿/返信/引用/リノートの結果(F-06)
     PostResult {
         result: Result<Box<Note>, String>,
@@ -736,8 +745,17 @@ impl NmnlApp {
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.runtime.spawn(async move {
-            let url = client.emoji(&name).await.ok().map(|e| e.url);
-            let _ = tx.send(AppEvent::EmojiResult { name, url });
+            let outcome = match client.emoji(&name).await {
+                Ok(e) => EmojiFetch::Found(e.url),
+                // io 実測: 存在しない絵文字名は INTERNAL_ERROR で返る
+                Err(api::ApiError::Server { code, .. })
+                    if code == "INTERNAL_ERROR" || code == "NO_SUCH_EMOJI" =>
+                {
+                    EmojiFetch::Missing
+                }
+                Err(_) => EmojiFetch::Transient,
+            };
+            let _ = tx.send(AppEvent::EmojiResult { name, outcome });
             ctx2.request_repaint();
         });
     }
@@ -916,6 +934,9 @@ impl NmnlApp {
                 if need {
                     self.spawn_followed_channels(id, ctx);
                 }
+                // 開いた時点で初期一覧を出す(io は query:"" でチャンネル一覧が返る。
+                // フォロー中が空でも検索なしで選べるようにする)
+                self.spawn_channel_search(id, String::new(), ctx);
             }
             UiOp::ChannelPickerQuery(id, q) => {
                 if let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == id) {
@@ -1303,11 +1324,14 @@ impl NmnlApp {
                 };
                 picker.loading = false;
                 match result {
-                    Ok(list) => picker.followed = list,
+                    Ok(list) => {
+                        picker.followed = list;
+                        picker.error = None;
+                    }
                     Err(e) => {
                         // 失敗しても loaded を true のままにすると再試行しないので戻す
                         picker.followed_loaded = false;
-                        col.error = Some(e);
+                        picker.error = Some(e);
                     }
                 }
             }
@@ -1328,13 +1352,18 @@ impl NmnlApp {
                 }
                 picker.loading = false;
                 match result {
-                    Ok(list) => picker.results = list,
-                    Err(e) => col.error = Some(e),
+                    Ok(list) => {
+                        picker.results = list;
+                        picker.error = None;
+                    }
+                    Err(e) => picker.error = Some(e),
                 }
             }
-            AppEvent::EmojiResult { name, url } => {
-                self.emoji_cache.complete(&name, url);
-            }
+            AppEvent::EmojiResult { name, outcome } => match outcome {
+                EmojiFetch::Found(url) => self.emoji_cache.complete(&name, Some(url)),
+                EmojiFetch::Missing => self.emoji_cache.complete(&name, None),
+                EmojiFetch::Transient => self.emoji_cache.fail_transient(&name),
+            },
             AppEvent::PostResult {
                 result,
                 files,

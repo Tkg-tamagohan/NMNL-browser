@@ -4,6 +4,11 @@
 //! 未解決の間は `:name:` テキスト表示のまま描く(モックと同じ見た目)。
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+/// 一時失敗(429・ネットワーク等)を恒久否定にしないための再試行間隔。
+/// なしだと描画ごとに再要求が走りリクエスト嵐になる
+const RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// アプリ全体の絵文字 URL キャッシュ。
 /// `None` は「サーバーに存在しない(404 など)」のキャッシュで、繰り返し
@@ -13,6 +18,8 @@ pub struct EmojiCache {
     resolved: HashMap<String, Option<String>>,
     /// 取得を投げた名前一覧(重複リクエスト防止)
     in_flight: HashSet<String>,
+    /// 一時失敗で再試行を待つ名前と再試行可能時刻
+    retry_after: HashMap<String, Instant>,
 }
 
 impl EmojiCache {
@@ -27,17 +34,25 @@ impl EmojiCache {
     }
 
     /// 名前を解決する。URL があれば Some(url)、未解決なら取得を予約して None。
-    /// 否定キャッシュ済みも None
+    /// 否定キャッシュ済みも None。一時失敗後はクールダウン経過まで再要求しない
     pub fn resolve(&mut self, name: &str) -> Option<String> {
-        match self.resolved.get(name) {
-            Some(url) => url.clone(),
-            None => {
-                if self.in_flight.insert(name.to_owned()) {
-                    // 呼び出し側(app)が drain して fetch を spawn する
-                }
-                None
-            }
+        if let Some(url) = self.resolved.get(name) {
+            return url.clone();
         }
+        if let Some(&at) = self.retry_after.get(name) {
+            if Instant::now() < at {
+                return None;
+            }
+            self.retry_after.remove(name);
+        }
+        self.in_flight.insert(name.to_owned());
+        None
+    }
+
+    /// 一時的な失敗(429、通信障害など)を記録し、クールダウン後に再試行する
+    pub fn fail_transient(&mut self, name: &str) {
+        self.retry_after
+            .insert(name.to_owned(), Instant::now() + RETRY_COOLDOWN);
     }
 
     /// 取得待ちの名前一覧を取り出してクリアする(app の update で回収)
@@ -103,4 +118,36 @@ pub fn emoji_list_bytes() -> u64 {
 /// 一覧キャッシュの消去(F-09-3)
 pub fn clear_emoji_list() {
     let _ = std::fs::remove_file(emoji_list_path());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // EMO-01: 一時失敗は否定キャッシュせず、クールダウン経過後に再要求される。
+    // クールダウン中は再要求しない(毎フレームの取得嵐を防ぐ)
+    #[test]
+    fn emo01_transient_retries_after_cooldown() {
+        let mut c = EmojiCache::default();
+        assert!(c.resolve("a").is_none());
+        assert_eq!(c.drain_pending(), vec!["a".to_owned()]);
+        c.fail_transient("a");
+        // クールダウン中: 再要求されない
+        assert!(c.resolve("a").is_none());
+        assert!(c.drain_pending().is_empty());
+        // クールダウン経過: 再要求される(否定キャッシュにならない)
+        c.retry_after
+            .insert("a".to_owned(), Instant::now() - Duration::from_secs(1));
+        assert!(c.resolve("a").is_none());
+        assert_eq!(c.drain_pending(), vec!["a".to_owned()]);
+    }
+
+    // EMO-02: サーバーの「存在しない」応答は否定キャッシュされ再要求しない
+    #[test]
+    fn emo02_missing_stays_negative_cached() {
+        let mut c = EmojiCache::default();
+        c.complete("a", None);
+        assert!(c.resolve("a").is_none());
+        assert!(c.drain_pending().is_empty());
+    }
 }

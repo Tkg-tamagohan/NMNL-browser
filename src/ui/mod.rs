@@ -1046,8 +1046,28 @@ fn channel_picker(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
             }
         }
     }
+    if let Some(err) = &picker.error {
+        let err = err.clone();
+        ui.label(
+            RichText::new(format!("⚠ {err}"))
+                .color(Color32::LIGHT_RED)
+                .size(11.0),
+        );
+    }
     if picker.loading {
         ui.label(RichText::new("読み込み中…").size(10.0).color(Color32::GRAY));
+    }
+    // 一覧がどちらも空のときは案内を出す(選び方が分からない状態を防ぐ)
+    if !picker.loading
+        && picker.error.is_none()
+        && picker.followed.is_empty()
+        && picker.results.is_empty()
+    {
+        ui.label(
+            RichText::new("チャンネルが見つかりませんでした。名前で検索できます")
+                .size(10.0)
+                .color(Color32::GRAY),
+        );
     }
 }
 
