@@ -447,6 +447,7 @@ fn image_thumb(
             ctx.ops.push(UiOp::OpenViewer {
                 files: images.to_vec(),
                 index,
+                revealed: ctx.card_state.media_open.clone(),
             });
         }
     }

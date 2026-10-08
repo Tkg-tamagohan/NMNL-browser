@@ -38,6 +38,9 @@ url = "2"
 urlencoding = "2"
 # トレイ常駐(F-09-4)。Linux は libappindicator3、Windows はネイティブ
 tray-icon = "0.21"
+
+# tray-icon の Linux バックエンドは先に GTK 初期化が必要(Windows では依存しない)
+[target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 
 [dev-dependencies]

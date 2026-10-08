@@ -100,6 +100,8 @@ pub struct CachedImageLoader {
     cache_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     client: reqwest::Client,
+    /// 消去ごとに進む世代。消去より前に始まった取得は結果を捨てる(MED-06)
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CachedImageLoader {
@@ -114,6 +116,7 @@ impl CachedImageLoader {
             cache: Arc::new(Mutex::new(MemCache::new())),
             cache_dir,
             runtime,
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // リダイレクトは手動で追い、ホップごとにスキームと宛先を再検証。
             // DNS 解決は接続時に独自リゾルバが行うので、検証と接続の間の
             // 再解決差し替え(TOCTOU/DNS rebinding)も塞がれる(N-02)
@@ -129,6 +132,9 @@ impl CachedImageLoader {
 
     /// キャッシュした URI をクリアする(設定画面のキャッシュ消去用、F-09-3)
     pub fn clear_all(&self) {
+        // 世代を進めて、消去前に始まった取得の書き戻しを防ぐ(MED-06)
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.cache.lock().clear();
         let _ = std::fs::remove_dir_all(&self.cache_dir);
         let _ = std::fs::create_dir_all(&self.cache_dir);
@@ -278,6 +284,8 @@ impl BytesLoader for CachedImageLoader {
         let cache = self.cache.clone();
         let client = self.client.clone();
         let cache_dir = self.cache_dir.clone();
+        let generation = self.generation.clone();
+        let gen_at_start = generation.load(std::sync::atomic::Ordering::SeqCst);
         let ctx = ctx.clone();
         self.runtime.spawn(async move {
             let result = load_uri(client, cache_dir, &uri_owned, &path).await;
@@ -285,7 +293,12 @@ impl BytesLoader for CachedImageLoader {
             if let Entry::Failed(msg) = &result {
                 eprintln!("[image] 取得失敗: {uri_owned} -> {msg}");
             }
-            cache.lock().insert(uri_owned, result);
+            if generation.load(std::sync::atomic::Ordering::SeqCst) != gen_at_start {
+                // 取得中にキャッシュ消去が走った分は書き戻さない(MED-06)
+                let _ = std::fs::remove_file(&path);
+            } else {
+                cache.lock().insert(uri_owned, result);
+            }
             ctx.request_repaint();
         });
         Ok(BytesPoll::Pending { size: None })

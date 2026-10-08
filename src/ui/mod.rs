@@ -77,10 +77,14 @@ pub enum UiOp {
     OpenViewer {
         files: Vec<crate::model::DriveFile>,
         index: usize,
+        /// カード側で既に開封済みのセンシティブ画像のファイル ID(VWR-02)
+        revealed: std::collections::HashSet<String>,
     },
     CloseViewer,
     /// ビューアの画像めくり(-1=前、+1=次)
     ViewerStep(i32),
+    /// ビューア内でのセンシティブ画像の開封(F-08-1, VWR-02)
+    ViewerReveal(String),
     /// プロフィールを開く(F-05-6)。user_id で users/show+users/notes を取る
     OpenProfile {
         user_id: String,
@@ -133,9 +137,16 @@ pub struct UiCtx<'a> {
 pub struct ViewerState {
     pub files: Vec<crate::model::DriveFile>,
     pub index: usize,
+    /// カード側で開封済みのセンシティブ画像のファイル ID(VWR-02)
+    pub revealed: std::collections::HashSet<String>,
 }
 
 impl ViewerState {
+    /// 表示してよい画像か(センシティブは開封済みのみ、VWR-02)
+    pub fn is_visible(&self, file: &crate::model::DriveFile) -> bool {
+        !file.is_sensitive || self.revealed.contains(&file.id)
+    }
+
     /// インデックスを ±1 動かす(範囲にクランプ、VWR-01)
     pub fn step(&mut self, delta: i32) {
         if self.files.is_empty() {
@@ -412,6 +423,7 @@ fn viewer_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
         step = 1;
     }
     let total = state.files.len();
+    let mut reveal: Option<String> = None;
     egui::Window::new(format!("画像 {} / {}", state.index + 1, total))
         .collapsible(false)
         .resizable(true)
@@ -434,7 +446,18 @@ fn viewer_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
                     ctx.ops.push(UiOp::OpenUrl(u.clone()));
                 }
             });
-            if let Some(u) = &file.url {
+            if !state.is_visible(file) {
+                // カードと同じく未開封の閲覧注意は覆ったまま(VWR-02)
+                if ui
+                    .button(
+                        RichText::new(format!("⚠ 閲覧注意: {}", file.name))
+                            .color(Color32::from_rgb(0xf0, 0xa0, 0x80)),
+                    )
+                    .clicked()
+                {
+                    reveal = Some(file.id.clone());
+                }
+            } else if let Some(u) = &file.url {
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -444,6 +467,9 @@ fn viewer_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
                 ui.label(RichText::new("(URL なし)").color(Color32::GRAY));
             }
         });
+    if let Some(id) = reveal {
+        ctx.ops.push(UiOp::ViewerReveal(id));
+    }
     if !open {
         ctx.ops.push(UiOp::CloseViewer);
     }
@@ -494,6 +520,16 @@ fn profile_window(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
                                         .size(11.0)
                                         .color(Color32::GRAY),
                                 );
+                                if let Some(c) = &u.created_at {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "登録: {}",
+                                            c.split('T').next().unwrap_or(c)
+                                        ))
+                                        .size(10.0)
+                                        .color(Color32::GRAY),
+                                    );
+                                }
                                 if let (Some(n), Some(fi), Some(fo)) =
                                     (u.notes_count, u.following_count, u.followers_count)
                                 {
@@ -1064,12 +1100,20 @@ mod tests {
         .unwrap()
     }
 
+    fn df_sensitive(id: &str) -> crate::model::DriveFile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": "x.png", "type": "image/png", "isSensitive": true
+        }))
+        .unwrap()
+    }
+
     // VWR-01: ビューアのページ送りが範囲にクランプされる(F-08-1)
     #[test]
     fn vwr01_step_clamps() {
         let mut v = ViewerState {
             files: vec![df("a"), df("b"), df("c")],
             index: 0,
+            revealed: Default::default(),
         };
         v.step(1);
         assert_eq!(v.index, 1);
@@ -1081,5 +1125,20 @@ mod tests {
         let mut e = ViewerState::default();
         e.step(3);
         assert_eq!(e.index, 0);
+    }
+
+    // VWR-02: ビューア内でも未開封の閲覧注意は覆ったまま(F-08-1)
+    #[test]
+    fn vwr02_sensitive_stays_covered() {
+        let mut v = ViewerState {
+            files: vec![df("a"), df_sensitive("b")],
+            index: 0,
+            revealed: Default::default(),
+        };
+        // 非センシティブはそのまま可視、センシティブは開封済みになるまで覆う
+        assert!(v.is_visible(&v.files[0]));
+        assert!(!v.is_visible(&v.files[1]));
+        v.revealed.insert("b".to_owned());
+        assert!(v.is_visible(&v.files[1]));
     }
 }

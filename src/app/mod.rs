@@ -147,6 +147,8 @@ enum AppEvent {
     EmojiListResult { result: Result<Vec<Emoji>, String> },
     /// プロフィールの取得結果(F-05-6)。users/show と users/notes を一括で取る
     ProfileResult {
+        /// 結果を捨てるかどうかの判定に使う要求時のユーザー ID(PRF-03)
+        user_id: String,
         user: Result<Box<User>, String>,
         notes: Result<Vec<Note>, String>,
     },
@@ -232,6 +234,13 @@ pub struct ProfileState {
     /// 取得中(どちらかでも未着)か
     pub loading: bool,
     pub error: Option<String>,
+}
+
+impl ProfileState {
+    /// 到着した結果が現在開いているユーザーのものか(PRF-03)
+    pub fn accepts(&self, user_id: &str) -> bool {
+        self.user_id == user_id
+    }
 }
 
 /// リアクションピッカーの開閉状態(検索クエリを保持)
@@ -993,8 +1002,21 @@ impl NmnlApp {
                 self.spawn_reaction(note_id, reaction, !mine, ctx);
             }
             // Phase 8: ビューア・プロフィール・設定
-            UiOp::OpenViewer { files, index } => {
-                self.viewer = Some(ui::ViewerState { files, index });
+            UiOp::OpenViewer {
+                files,
+                index,
+                revealed,
+            } => {
+                self.viewer = Some(ui::ViewerState {
+                    files,
+                    index,
+                    revealed,
+                });
+            }
+            UiOp::ViewerReveal(file_id) => {
+                if let Some(v) = &mut self.viewer {
+                    v.revealed.insert(file_id);
+                }
             }
             UiOp::CloseViewer => {
                 self.viewer = None;
@@ -1063,7 +1085,11 @@ impl NmnlApp {
                 )
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::ProfileResult { user, notes });
+            let _ = tx.send(AppEvent::ProfileResult {
+                user_id,
+                user,
+                notes,
+            });
             ctx2.request_repaint();
         });
     }
@@ -1356,8 +1382,15 @@ impl NmnlApp {
                     self.notice = Some(format!("リアクション失敗: {e}"));
                 }
             },
-            AppEvent::ProfileResult { user, notes } => {
-                if let Some(p) = &mut self.profile {
+            AppEvent::ProfileResult {
+                user_id,
+                user,
+                notes,
+            } => {
+                // 別ユーザーを開き直した後に届いた遅れ結果は捨てる(PRF-03)
+                if let Some(p) = &mut self.profile
+                    && p.accepts(&user_id)
+                {
                     p.loading = false;
                     match user {
                         Ok(u) => p.user = Some(*u),
@@ -1764,4 +1797,22 @@ fn tray_icon_pixels() -> Vec<u8> {
         }
     }
     px
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PRF-03: 開いているユーザーと違う到着結果は採用しない(F-05-6)
+    #[test]
+    fn prf03_profile_result_matching() {
+        let mut p = ProfileState {
+            user_id: "alice".to_owned(),
+            ..Default::default()
+        };
+        assert!(p.accepts("alice"));
+        assert!(!p.accepts("bob"));
+        p.user_id = "bob".to_owned();
+        assert!(p.accepts("bob"));
+    }
 }
