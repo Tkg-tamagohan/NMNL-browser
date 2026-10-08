@@ -179,7 +179,7 @@ impl Composer {
 }
 
 /// 即時リノートのリクエスト(F-06)。対象がチャンネル所属なら
-/// channelId を継承して同じチャンネルへ送る(仕様決定 W・io で受理可否を検証)
+/// channelId を継承して同じチャンネルへ送る(仕様決定 W。継承時の io 受理と反映は未検証)
 pub fn renote_request(note_id: &str, channel: Option<&NoteChannel>) -> CreateNote {
     CreateNote {
         renote_id: Some(note_id.to_owned()),
