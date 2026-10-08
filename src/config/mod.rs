@@ -112,6 +112,8 @@ pub struct ColumnSpec {
     pub timeline: Option<TimelineKind>,
     pub channel_id: Option<String>,
     pub filters: ColumnFilters,
+    /// 通知カラムの除外種別(F-04-1)。カラムごとの設定として永続化(F-02-3/F-09-2)
+    pub ntf_exclude: Vec<String>,
 }
 
 impl Default for ColumnSpec {
@@ -122,6 +124,7 @@ impl Default for ColumnSpec {
             timeline: None,
             channel_id: None,
             filters: ColumnFilters::default(),
+            ntf_exclude: Vec::new(),
         }
     }
 }

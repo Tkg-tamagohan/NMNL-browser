@@ -20,11 +20,21 @@ keyring = { version = "3", features = ["windows-native", "linux-native-sync-pers
 uuid = { version = "1", features = ["v4"] }
 open = "5"
 tempfile = "3"
+# 画像デコード(ImageLoader)。URI→バイト列は自前の BytesLoader(ディスク LRU、F-08-2)。
+# misskey が返す画像は webp/gif が大半のため、対応フォーマットを有効化する
+# (png のみだと全外部画像がプレースホルダ表示になる)
+egui_extras = { version = "0.32", features = ["image", "gif", "webp"] }
+# jpeg 対応(egui_extras 側には jpeg 機能がないため、feature 統合で image を強化)。
+# 既定機能は不要フォーマット(AVIF 等)まで引き込むため外し、必要分のみ
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# キャッシュファイル名の安定化(F-08-2)。MIT/Apache-2.0 デュアル
+sha2 = "0.10"
 futures-util = "0.3"
 # connect_async(クライアント)+ accept_async(テスト用サーバー)と rustls TLS。
 # reqwest と同じく webpki-roots 系で統一する
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # WS URL のトークンを ?i= に載せるときのパーセントエンコード用(MIT)
+url = "2"
 urlencoding = "2"
 
 [dev-dependencies]

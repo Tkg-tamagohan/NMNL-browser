@@ -6,5 +6,9 @@
 pub mod api;
 pub mod app;
 pub mod config;
+pub mod deck;
+pub mod emoji;
+pub mod image_loader;
 pub mod model;
 pub mod streaming;
+pub mod ui;

@@ -61,6 +61,7 @@ pub enum MiauthStatus {
     Authorized { token: String },
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     http: reqwest::Client,
     /// `https://{host}/api`。テストではモックサーバーの URL を差し込む
@@ -139,14 +140,26 @@ impl ApiClient {
             break resp;
         };
         let status = resp.status();
-        let value: serde_json::Value = resp.json().await.map_err(ApiError::Network)?;
         if !status.is_success() {
-            let err = &value["error"];
+            // エラー応答は `{"error":{...}}` が普通だが、Cloudflare 等が
+            // HTML や空ボディを返すことがあるため status を先に見る
+            let text = resp.text().await.map_err(ApiError::Network)?;
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let err = &value["error"];
+                return Err(ApiError::Server {
+                    code: err["code"].as_str().unwrap_or("UNKNOWN").to_owned(),
+                    message: err["message"].as_str().unwrap_or("不明なエラー").to_owned(),
+                });
+            }
             return Err(ApiError::Server {
-                code: err["code"].as_str().unwrap_or("UNKNOWN").to_owned(),
-                message: err["message"].as_str().unwrap_or("不明なエラー").to_owned(),
+                code: format!("HTTP {}", status.as_u16()),
+                message: format!(
+                    "非 JSON 応答(先頭 120 文字): {}",
+                    text.chars().take(120).collect::<String>()
+                ),
             });
         }
+        let value: serde_json::Value = resp.json().await.map_err(ApiError::Network)?;
         serde_json::from_value(value).map_err(|e| ApiError::Unexpected(e.to_string()))
     }
 
@@ -332,24 +345,28 @@ impl TimelinePage {
 fn apply_column_filters(notes: Vec<Note>, filters: &ColumnFilters) -> Vec<Note> {
     notes
         .into_iter()
-        .filter(|n| {
-            if !filters.include_replies && n.reply_id.is_some() {
-                return false;
-            }
-            // 純粋なリノート(本文・CW・添付を持たない転載)のみ落とし、引用は残す。
-            // text が null でも添付を持つものは引用なので残す(io 実測で存在)
-            if !filters.include_renotes && n.is_pure_renote() {
-                return false;
-            }
-            if filters.files_only
-                && n.files.is_empty()
-                && n.renote.as_ref().is_none_or(|r| r.files.is_empty())
-            {
-                return false;
-            }
-            true
-        })
+        .filter(|n| note_allowed(n, filters))
         .collect()
+}
+
+/// カラムフィルタ(F-03-4)を 1 件のノートに適用する。REST のページ適用と
+/// ストリーミング差分の挿入判定で共用するため crate 内で公開する
+pub(crate) fn note_allowed(n: &Note, filters: &ColumnFilters) -> bool {
+    if !filters.include_replies && n.reply_id.is_some() {
+        return false;
+    }
+    // 純粋なリノート(本文・CW・添付を持たない転載)のみ落とし、引用は残す。
+    // text が null でも添付を持つものは引用なので残す(io 実測で存在)
+    if !filters.include_renotes && n.is_pure_renote() {
+        return false;
+    }
+    if filters.files_only
+        && n.files.is_empty()
+        && n.renote.as_ref().is_none_or(|r| r.files.is_empty())
+    {
+        return false;
+    }
+    true
 }
 
 /// `users/show` の指定方法
@@ -958,5 +975,28 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "e1");
         m.assert_async().await;
+    }
+
+    // API-06: 非 JSON のエラーボディ(Cloudflare HTML や空)は HTTP status を
+    // 先に見て Server エラーにする。「error decoding response body」に化けない
+    #[tokio::test]
+    async fn api06_non_json_error_body() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/notes/conversation");
+                then.status(520)
+                    .header("content-type", "text/html")
+                    .body("<html>cloudflare error</html>");
+            })
+            .await;
+        let client =
+            ApiClient::for_test(format!("{}/api", server.base_url()), Some("t".to_owned()));
+        let err = client.conversation("x", 1, 0).await.unwrap_err();
+        match &err {
+            ApiError::Server { code, .. } => assert_eq!(code, "HTTP 520"),
+            _ => panic!("Server エラーのはず: {err:?}"),
+        }
     }
 }
