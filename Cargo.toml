@@ -20,6 +20,10 @@ keyring = { version = "3", features = ["windows-native", "linux-native-sync-pers
 uuid = { version = "1", features = ["v4"] }
 open = "5"
 tempfile = "3"
+# 画像デコード(ImageLoader)。URI→バイト列は自前の BytesLoader(ディスク LRU、F-08-2)
+egui_extras = { version = "0.32", features = ["image"] }
+# キャッシュファイル名の安定化(F-08-2)。MIT/Apache-2.0 デュアル
+sha2 = "0.10"
 futures-util = "0.3"
 # connect_async(クライアント)+ accept_async(テスト用サーバー)と rustls TLS。
 # reqwest と同じく webpki-roots 系で統一する

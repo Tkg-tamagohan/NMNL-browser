@@ -1,11 +1,19 @@
 //! アプリ状態とイベント集約層。
 //! UI(egui)は通信層を直接呼ばず、tokio タスクが結果を `AppEvent` として
 //! チャネル経由で返し、`update` で状態遷移させる。
+//! Phase 6 では認証完了後にストリーミングを張り、カラムごとの REST 初期
+//! 取得/ページング/欠落補充/購読管理をここで集約する(F-03-5/6)。
 
-use crate::api::{self, ApiClient, MiauthStatus};
-use crate::config::{self, AppConfig};
-use crate::model::User;
+use crate::api::{self, ApiClient, MiauthStatus, Paging, TimelinePage};
+use crate::config::{self, AppConfig, ColumnKind, ColumnSpec};
+use crate::deck::{AddableKind, ColumnDeck, ColumnView};
+use crate::emoji::EmojiCache;
+use crate::model::{Channel, Note, Notification, User};
+use crate::streaming::{self, StreamChannel, StreamEvent, StreamHandle};
+use crate::ui::{self, CardState, UiCtx, UiOp};
 use eframe::egui;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -18,6 +26,12 @@ const MIAUTH_MAX_FAILURES: u32 = 15;
 /// 認可直後の /api/i 検証の試行数と間隔(トークン伝播の遅延を吸収する)
 const MIAUTH_VERIFY_ATTEMPTS: u32 = 3;
 const MIAUTH_VERIFY_DELAY: Duration = Duration::from_secs(2);
+/// REST 取得のページサイズ(F-03-3)
+const PAGE_LIMIT: u32 = 30;
+/// 欠落補充のページサイズ。切断中の欠落はこれで拾い、超過分は次回再接続で追う
+const BACKFILL_LIMIT: u32 = 50;
+/// 絵文字の同時取得上限(フレームあたり)
+const EMOJI_BATCH: usize = 12;
 
 #[derive(Debug)]
 enum AuthState {
@@ -49,6 +63,25 @@ enum UiAction {
     ReLogin,
 }
 
+/// REST 取得の種別(初回・過去ページ・再接続の欠落補充)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchKind {
+    Initial,
+    Next,
+    Backfill,
+}
+
+/// REST 取得結果。カラム種別で応答の型が違うので enum で包む
+#[derive(Debug)]
+enum FetchResult {
+    /// TL/チャンネル(フィルタ適用済み+生カーソル)
+    Page(TimelinePage),
+    /// メンション(生の Vec。カーソルは先頭/末尾 ID から計算)
+    Mentions(Vec<Note>),
+    /// 通知一覧
+    Notifications(Vec<Notification>),
+}
+
 #[derive(Debug)]
 enum AppEvent {
     VerifyResult {
@@ -58,6 +91,37 @@ enum AppEvent {
     MiauthResult {
         result: Result<(String, User), String>,
     },
+    /// 購読の ack(sub_id の確定)
+    Subscribed {
+        channel: StreamChannel,
+        sub_id: String,
+    },
+    /// カラムの REST 取得完了
+    FetchResult {
+        col_id: u64,
+        kind: FetchKind,
+        result: Result<FetchResult, String>,
+    },
+    /// 会話ビュー(F-05-5): 選択ノート自身 + 会話チェーン
+    ConversationResult {
+        col_id: u64,
+        root: Option<Box<Note>>,
+        result: Result<Vec<Note>, String>,
+    },
+    /// フォロー中チャンネル一覧(F-03-7)
+    FollowedResult {
+        col_id: u64,
+        result: Result<Vec<Channel>, String>,
+    },
+    /// チャンネル検索結果(F-03-7)
+    ChannelSearchResult {
+        col_id: u64,
+        result: Result<Vec<Channel>, String>,
+    },
+    /// 絵文字のオンデマンド解決結果(F-05-2)
+    EmojiResult { name: String, url: Option<String> },
+    /// ストリーミング層からの転送イベント
+    Stream(StreamEvent),
 }
 
 pub struct NmnlApp {
@@ -73,6 +137,25 @@ pub struct NmnlApp {
     /// 環境変数トークン由来か(開発用の入口)
     token_from_env: bool,
     miauth_task: Option<JoinHandle<()>>,
+    // Phase 6: デッキと通信
+    deck: ColumnDeck,
+    /// 認証済みの API クライアント(生成は一度だけ)
+    client: Option<ApiClient>,
+    /// 多重化 WS のハンドル。 None = 未接続
+    stream: Option<StreamHandle>,
+    /// 購読中のチャンネル→sub_id(subscribe の ack で確定)
+    subs: HashMap<StreamChannel, String>,
+    /// ストリーミング接続の表示用文字列
+    stream_status: String,
+    /// 認証後に初期取得を流したか(認証遷移の一度きりガード)
+    bootstrapped_stream: bool,
+    // UI 状態
+    emoji_cache: EmojiCache,
+    card_state: CardState,
+    settings_open: Option<u64>,
+    picker_open: Option<u64>,
+    resize_base: Option<(u64, f32)>,
+    add_kind: AddableKind,
 }
 
 impl NmnlApp {
@@ -80,6 +163,16 @@ impl NmnlApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let config = AppConfig::load();
         let runtime = tokio::runtime::Runtime::new().expect("tokio ランタイムの起動に失敗");
+
+        // 画像ローダー: デコーダは egui_extras、URI→バイトは自前のディスクキャッシュ
+        // 付きローダー(F-08-2)。bytes loader は後から登録したものが先に試される
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        cc.egui_ctx
+            .add_bytes_loader(Arc::new(crate::image_loader::CachedImageLoader::new(
+                runtime.handle().clone(),
+            )));
+
+        let deck = ColumnDeck::from_specs(config.columns.clone());
 
         let mut app = Self {
             runtime,
@@ -91,6 +184,18 @@ impl NmnlApp {
             token_persisted: false,
             token_from_env: false,
             miauth_task: None,
+            deck,
+            client: None,
+            stream: None,
+            subs: HashMap::new(),
+            stream_status: "未接続".to_owned(),
+            bootstrapped_stream: false,
+            emoji_cache: EmojiCache::default(),
+            card_state: CardState::default(),
+            settings_open: None,
+            picker_open: None,
+            resize_base: None,
+            add_kind: AddableKind::Timeline(config::TimelineKind::Home),
         };
 
         match config::token::resolve_token(config::HOST) {
@@ -194,7 +299,396 @@ impl NmnlApp {
         self.auth = AuthState::MiauthWaiting { session_id };
     }
 
-    fn handle_event(&mut self, ev: AppEvent) {
+    /// 認証完了時に呼ぶ。WS を張り、各カラムの購読と初回 REST を流す
+    fn bootstrap_streaming(&mut self, ctx: &egui::Context) {
+        if self.bootstrapped_stream {
+            return;
+        }
+        self.bootstrapped_stream = true;
+        let Some(token) = self.token.clone() else {
+            return;
+        };
+        self.client = Some(ApiClient::with_token(config::HOST, token.clone()));
+        // StreamManager::spawn は内部で tokio::spawn を呼ぶため、
+        // UI スレッド側ではランタイムのコンテキストに入ってから実行する
+        let mut stream = {
+            let _guard = self.runtime.enter();
+            streaming::StreamManager::spawn(config::HOST, Some(&token))
+        };
+        // ストリーミングイベントを AppEvent へ転送するフォワーダ。
+        // egui は repaint 要求が無いと update を回さないので、
+        // 到着ごとに request_repaint で UI スレッドを起こす
+        let mut srx = stream.take_event_rx();
+        let ftx = self.tx.clone();
+        let fctx = ctx.clone();
+        self.runtime.spawn(async move {
+            while let Some(ev) = srx.recv().await {
+                if ftx.send(AppEvent::Stream(ev)).is_err() {
+                    break;
+                }
+                fctx.request_repaint();
+            }
+        });
+        self.stream = Some(stream);
+        self.sync_subscriptions(ctx);
+        let ids: Vec<u64> = self.deck.columns.iter().map(|c| c.id).collect();
+        for id in ids {
+            self.spawn_fetch(id, FetchKind::Initial, ctx);
+        }
+    }
+
+    /// カラム構成と購読を同期する(F-02-1 の追加/削除・F-03-7 のチャンネル変更)
+    fn sync_subscriptions(&mut self, ctx: &egui::Context) {
+        let Some(stream) = &self.stream else {
+            return;
+        };
+        // いま必要なチャンネル集合(複数カラムが同じチャンネルを共有する)
+        let mut desired: std::collections::HashSet<StreamChannel> =
+            std::collections::HashSet::new();
+        for col in &self.deck.columns {
+            if let Some(ch) = col.stream_channel() {
+                desired.insert(ch);
+            }
+        }
+        // 不要になった購読を解除
+        let stale: Vec<StreamChannel> = self
+            .subs
+            .keys()
+            .filter(|ch| !desired.contains(*ch))
+            .cloned()
+            .collect();
+        for ch in stale {
+            if let Some(sub_id) = self.subs.remove(&ch) {
+                stream.unsubscribe(&sub_id);
+            }
+        }
+        // 新しい分を張る
+        for ch in desired {
+            if self.subs.contains_key(&ch) {
+                continue;
+            }
+            let rx = stream.subscribe(ch.clone());
+            let tx = self.tx.clone();
+            let ch_clone = ch.clone();
+            let ctx2 = ctx.clone();
+            self.runtime.spawn(async move {
+                if let Ok(sub_id) = rx.await {
+                    let _ = tx.send(AppEvent::Subscribed {
+                        channel: ch_clone,
+                        sub_id,
+                    });
+                    ctx2.request_repaint();
+                }
+            });
+        }
+    }
+
+    /// カラムの REST 取得を spawn する。取得中フラグで二重発行を抑止
+    fn spawn_fetch(&mut self, col_id: u64, kind: FetchKind, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
+            return;
+        };
+        if col.fetching {
+            return;
+        }
+        // 取得条件: メインカラムは対象外、チャンネルは選択済みのみ
+        if matches!(col.spec.kind, ColumnKind::Main) {
+            return;
+        }
+        if matches!(col.spec.kind, ColumnKind::Channel) && col.spec.channel_id.is_none() {
+            return;
+        }
+        let paging = match kind {
+            FetchKind::Initial => Paging {
+                limit: PAGE_LIMIT,
+                ..Default::default()
+            },
+            FetchKind::Next => {
+                let Some(until) = col.oldest_id.clone() else {
+                    return; // 初回取得がまだなら何もしない
+                };
+                if col.exhausted {
+                    return;
+                }
+                Paging {
+                    limit: PAGE_LIMIT,
+                    until_id: Some(until),
+                    since_id: None,
+                }
+            }
+            FetchKind::Backfill => {
+                let Some(since) = col.newest_id.clone() else {
+                    // 未取得なら初回取得に倒す
+                    return self.spawn_fetch(col_id, FetchKind::Initial, ctx);
+                };
+                Paging {
+                    limit: BACKFILL_LIMIT,
+                    until_id: None,
+                    since_id: Some(since),
+                }
+            }
+        };
+        let spec = col.spec.clone();
+        let ntf_excludes = col.ntf_filter.exclude_types();
+        col.fetching = true;
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let result = fetch_page_impl(&client, &spec, &paging, &ntf_excludes).await;
+            let _ = tx.send(AppEvent::FetchResult {
+                col_id,
+                kind,
+                result,
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 会話ビュー用に選択ノート + 会話チェーンを取る(F-05-5)
+    fn spawn_conversation(&self, col_id: u64, note_id: String, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let root = client.show_note(&note_id).await.ok().map(Box::new);
+            let result = client
+                .conversation(&note_id, 30, 0)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ConversationResult {
+                col_id,
+                root,
+                result,
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// フォロー中チャンネル一覧(F-03-7)
+    fn spawn_followed_channels(&self, col_id: u64, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .followed_channels(&Paging {
+                    limit: 100,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::FollowedResult { col_id, result });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// チャンネル検索(F-03-7)
+    fn spawn_channel_search(&self, col_id: u64, query: String, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .search_channels(&query, 20, 0)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::ChannelSearchResult { col_id, result });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 絵文字のオンデマンド取得(F-05-2)
+    fn spawn_emoji(&self, name: String, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let ctx2 = ctx.clone();
+        self.runtime.spawn(async move {
+            let url = client.emoji(&name).await.ok().map(|e| e.url);
+            let _ = tx.send(AppEvent::EmojiResult { name, url });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// ストリーミングイベントをデッキへ振り分ける
+    fn handle_stream_event(&mut self, ev: StreamEvent, ctx: &egui::Context) {
+        match ev {
+            StreamEvent::Connected { is_reconnect } => {
+                self.stream_status = "接続中".to_owned();
+                if is_reconnect {
+                    // 切断中の欠落を REST で補充する(F-03-6)
+                    let ids: Vec<u64> = self.deck.columns.iter().map(|c| c.id).collect();
+                    for id in ids {
+                        self.spawn_fetch(id, FetchKind::Backfill, ctx);
+                    }
+                }
+            }
+            StreamEvent::Disconnected { attempt, retry_in } => {
+                self.stream_status = format!(
+                    "切断(再接続 {attempt} 回目、{:.0} 秒後)",
+                    retry_in.as_secs_f32()
+                );
+            }
+            StreamEvent::Subscribed { .. } => {
+                // 購読 ack は sub_id のみ。チャンネルは AppEvent::Subscribed で別経路で届く
+            }
+            StreamEvent::Note { channel, note, .. } => {
+                // ノート本文とその発信者の絵文字をキャッシュへ(F-05-2 の第 1 ソース)
+                self.absorb_note_emojis(&note);
+                for col in &mut self.deck.columns {
+                    if col.stream_channel() == Some(channel.clone()) {
+                        col.push_note(*note.clone());
+                    }
+                }
+            }
+            StreamEvent::Notification { notification, .. } => {
+                let n = *notification;
+                if let Some(note) = &n.note {
+                    self.absorb_note_emojis(note);
+                }
+                for col in &mut self.deck.columns {
+                    match col.spec.kind {
+                        ColumnKind::Notifications => {
+                            col.push_notification(n.clone());
+                        }
+                        // メンションカラムは main の通知イベントからノートを拾う(F-04-2)
+                        ColumnKind::Mentions if is_mention_kind(&n.kind) => {
+                            if let Some(note) = &n.note {
+                                col.push_note(note.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// ノートと入れ子ノートの絵文字マップをキャッシュへ吸収する
+    fn absorb_note_emojis(&mut self, note: &Note) {
+        self.emoji_cache.absorb_note_emojis(&note.emojis);
+        self.emoji_cache.absorb_note_emojis(&note.user.emojis);
+        if let Some(r) = &note.reply {
+            self.emoji_cache.absorb_note_emojis(&r.emojis);
+            self.emoji_cache.absorb_note_emojis(&r.user.emojis);
+        }
+        if let Some(r) = &note.renote {
+            self.emoji_cache.absorb_note_emojis(&r.emojis);
+            self.emoji_cache.absorb_note_emojis(&r.user.emojis);
+        }
+    }
+
+    /// UI 命令の適用(描画後に 1 件ずつ)
+    fn apply_op(&mut self, op: UiOp, ctx: &egui::Context) {
+        match op {
+            UiOp::AddColumn(kind) => {
+                let id = self.deck.add(kind);
+                self.sync_subscriptions(ctx);
+                self.spawn_fetch(id, FetchKind::Initial, ctx);
+            }
+            UiOp::Remove(id) => {
+                self.deck.remove(id);
+                self.sync_subscriptions(ctx);
+            }
+            UiOp::MoveTo(id, to) => self.deck.move_to(id, to),
+            UiOp::SetWidth(id, w) => self.deck.set_width(id, w),
+            UiOp::SetPaused(id, p) => self.deck.set_paused(id, p),
+            UiOp::SetTimelineKind(id, k) => {
+                self.deck.set_timeline_kind(id, k);
+                self.sync_subscriptions(ctx);
+                self.spawn_fetch(id, FetchKind::Initial, ctx);
+            }
+            UiOp::SetChannel(id, ch) => {
+                self.deck.set_channel(id, ch);
+                self.sync_subscriptions(ctx);
+                self.spawn_fetch(id, FetchKind::Initial, ctx);
+            }
+            UiOp::SetFilters(id, f) => {
+                self.deck.set_filters(id, f);
+                self.spawn_fetch(id, FetchKind::Initial, ctx);
+            }
+            UiOp::SetNtfFilter(id, f) => {
+                self.deck.set_ntf_filter(id, f);
+                self.spawn_fetch(id, FetchKind::Initial, ctx);
+            }
+            UiOp::FetchNextPage(id) => {
+                let kind = if self
+                    .deck
+                    .columns
+                    .iter()
+                    .find(|c| c.id == id)
+                    .is_some_and(|c| c.items.is_empty())
+                {
+                    FetchKind::Initial
+                } else {
+                    FetchKind::Next
+                };
+                self.spawn_fetch(id, kind, ctx);
+            }
+            UiOp::OpenConversation(id, note_id) => {
+                if let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == id) {
+                    col.view = ColumnView::Conversation {
+                        root_id: note_id.clone(),
+                        notes: Vec::new(),
+                        loading: true,
+                        error: None,
+                    };
+                }
+                self.spawn_conversation(id, note_id, ctx);
+            }
+            UiOp::CloseConversation(id) => {
+                if let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == id) {
+                    col.view = ColumnView::Timeline;
+                }
+            }
+            UiOp::ChannelPickerOpen(id) => {
+                let need = self
+                    .deck
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.id == id)
+                    .map(|col| {
+                        let picker = col.channel_picker.get_or_insert_with(Default::default);
+                        if !picker.followed_loaded {
+                            picker.loading = true;
+                            picker.followed_loaded = true;
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if need {
+                    self.spawn_followed_channels(id, ctx);
+                }
+            }
+            UiOp::ChannelPickerQuery(id, q) => {
+                if let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == id) {
+                    let picker = col.channel_picker.get_or_insert_with(Default::default);
+                    picker.query = q.clone();
+                    picker.loading = !q.is_empty();
+                }
+                if !q.is_empty() {
+                    self.spawn_channel_search(id, q, ctx);
+                }
+            }
+            UiOp::OpenUrl(u) => {
+                let _ = open::that(&u);
+            }
+        }
+    }
+
+    fn handle_event(&mut self, ev: AppEvent, ctx: &egui::Context) {
         match ev {
             AppEvent::VerifyResult {
                 result,
@@ -237,20 +731,217 @@ impl NmnlApp {
                     }
                 }
             }
+            AppEvent::Subscribed { channel, sub_id } => {
+                self.subs.insert(channel, sub_id);
+            }
+            AppEvent::Stream(ev) => {
+                self.handle_stream_event(ev, ctx);
+            }
+            AppEvent::FetchResult {
+                col_id,
+                kind,
+                result,
+            } => {
+                let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
+                    return;
+                };
+                // 生応答が空なら過去は尽きた(F-03-3)。フィルタで全件落ちても
+                // カーソルは進むので raw の空判定は oldest_id/件数で見る
+                let raw_empty = match &result {
+                    Ok(FetchResult::Page(p)) => p.oldest_id.is_none() && p.newest_id.is_none(),
+                    Ok(FetchResult::Mentions(v)) => v.is_empty(),
+                    Ok(FetchResult::Notifications(v)) => v.is_empty(),
+                    Err(_) => false,
+                };
+                match result {
+                    Ok(FetchResult::Page(page)) => {
+                        col.append_page(page.notes, page.oldest_id, page.newest_id);
+                    }
+                    Ok(FetchResult::Mentions(notes)) => {
+                        // メンションもカーソルは生応答の先頭/末尾から取る
+                        let newest = notes.first().map(|n| n.id.clone());
+                        let oldest = notes.last().map(|n| n.id.clone());
+                        col.append_page(notes, oldest, newest);
+                    }
+                    Ok(FetchResult::Notifications(notifs)) => {
+                        let newest = notifs.first().map(|n| n.id.clone());
+                        let oldest = notifs.last().map(|n| n.id.clone());
+                        col.append_notif_page(notifs, oldest, newest);
+                    }
+                    Err(msg) => {
+                        col.error = Some(msg);
+                    }
+                }
+                col.fetching = false;
+                if raw_empty && !matches!(kind, FetchKind::Backfill) {
+                    col.exhausted = true;
+                }
+            }
+            AppEvent::ConversationResult {
+                col_id,
+                root,
+                result,
+            } => {
+                let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
+                    return;
+                };
+                let ColumnView::Conversation {
+                    notes,
+                    loading,
+                    error,
+                    ..
+                } = &mut col.view
+                else {
+                    return;
+                };
+                *loading = false;
+                match result {
+                    Ok(mut conv) => {
+                        // 選択ノート自身を先頭に挿入(重複は除く)
+                        conv.retain(|n| Some(&n.id) != root.as_ref().map(|r| &r.id));
+                        if let Some(r) = root {
+                            conv.insert(0, *r);
+                        }
+                        *notes = conv;
+                    }
+                    Err(e) => {
+                        *error = Some(e);
+                    }
+                }
+            }
+            AppEvent::FollowedResult { col_id, result } => {
+                let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
+                    return;
+                };
+                let Some(picker) = col.channel_picker.as_mut() else {
+                    return;
+                };
+                picker.loading = false;
+                match result {
+                    Ok(list) => picker.followed = list,
+                    Err(e) => col.error = Some(e),
+                }
+            }
+            AppEvent::ChannelSearchResult { col_id, result } => {
+                let Some(col) = self.deck.columns.iter_mut().find(|c| c.id == col_id) else {
+                    return;
+                };
+                let Some(picker) = col.channel_picker.as_mut() else {
+                    return;
+                };
+                picker.loading = false;
+                match result {
+                    Ok(list) => picker.results = list,
+                    Err(e) => col.error = Some(e),
+                }
+            }
+            AppEvent::EmojiResult { name, url } => {
+                self.emoji_cache.complete(&name, url);
+            }
         }
+    }
+}
+
+/// メンションカラムに流す通知種別(F-04-2)。io のメンションは
+/// mention/reply/quote を含む(通知で届く自分宛のノート)
+fn is_mention_kind(kind: &str) -> bool {
+    matches!(kind, "mention" | "reply" | "quote")
+}
+
+/// カラムの REST 取得の分岐。カラム種別でエンドポイントと応答型が違う
+async fn fetch_page_impl(
+    client: &ApiClient,
+    spec: &ColumnSpec,
+    paging: &Paging,
+    ntf_excludes: &[String],
+) -> Result<FetchResult, String> {
+    match spec.kind {
+        ColumnKind::Timeline => {
+            let tl_kind = spec.timeline.unwrap_or(config::TimelineKind::Home);
+            client
+                .timeline(tl_kind, paging, &spec.filters)
+                .await
+                .map(FetchResult::Page)
+                .map_err(|e| e.to_string())
+        }
+        ColumnKind::Channel => {
+            let Some(channel_id) = &spec.channel_id else {
+                return Err("チャンネルが未選択です".to_owned());
+            };
+            client
+                .channel_timeline(channel_id, paging, &spec.filters)
+                .await
+                .map(FetchResult::Page)
+                .map_err(|e| e.to_string())
+        }
+        ColumnKind::Mentions => client
+            .mentions(paging)
+            .await
+            .map(FetchResult::Mentions)
+            .map_err(|e| e.to_string()),
+        ColumnKind::Notifications => client
+            .notifications(paging, &[], ntf_excludes)
+            .await
+            .map(FetchResult::Notifications)
+            .map_err(|e| e.to_string()),
+        ColumnKind::Main => Err("メインカラムは取得対象外です".to_owned()),
     }
 }
 
 impl eframe::App for NmnlApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(ev) = self.rx.try_recv() {
-            self.handle_event(ev);
+            self.handle_event(ev, ctx);
+        }
+        // 認証後の初回ブートストラップ
+        if matches!(self.auth, AuthState::Authenticated { .. }) {
+            self.bootstrap_streaming(ctx);
         }
         // ウィンドウサイズを設定に反映しておく(終了時に保存)
         let size = ctx.input(|i| i.screen_rect().size());
         if size.x > 0.0 && size.y > 0.0 {
             self.config.window.width = size.x;
             self.config.window.height = size.y;
+        }
+
+        // 認証済みならデッキ、未認証なら認証 UI を出す
+        let authed = matches!(self.auth, AuthState::Authenticated { .. });
+        if authed {
+            let me = match &self.auth {
+                AuthState::Authenticated { user } => Some(user),
+                _ => None,
+            };
+            let mut ops = Vec::new();
+            {
+                let mut ui_ctx = UiCtx {
+                    ops: &mut ops,
+                    emoji_cache: &mut self.emoji_cache,
+                    card_state: &mut self.card_state,
+                    settings_open: &mut self.settings_open,
+                    picker_open: &mut self.picker_open,
+                    resize_base: &mut self.resize_base,
+                    add_kind: &mut self.add_kind,
+                    stream_status: &self.stream_status,
+                    me,
+                };
+                ui::deck_ui(ctx, &mut self.deck, &mut ui_ctx);
+            }
+            for op in ops {
+                self.apply_op(op, ctx);
+            }
+            // 描画中に解決要求が来た絵文字を取得する(F-05-2)
+            let pending = self.emoji_cache.drain_pending();
+            for name in pending.into_iter().take(EMOJI_BATCH) {
+                self.spawn_emoji(name, ctx);
+            }
+            // カラム構成の変更を設定へ反映(F-02-3)
+            if self.deck.take_dirty() {
+                self.config.columns = self.deck.specs();
+                if let Err(e) = self.config.save() {
+                    eprintln!("設定の保存に失敗しました: {e}");
+                }
+            }
+            return;
         }
 
         let mut action = None;
@@ -287,17 +978,7 @@ impl eframe::App for NmnlApp {
                         action = Some(UiAction::ReLogin);
                     }
                 }
-                AuthState::Authenticated { user } => {
-                    let display = user.name.as_deref().unwrap_or(&user.username);
-                    ui.label(format!("{display}(@{})としてログイン中", user.username));
-                    if self.token_from_env {
-                        ui.label("開発用トークン(環境変数)を使用中です。");
-                    } else if !self.token_persisted {
-                        ui.label(
-                            "この環境ではキーリングを利用できないため、次回起動時に再認証が必要です。",
-                        );
-                    }
-                }
+                AuthState::Authenticated { .. } => {}
             }
         });
         match action {
@@ -325,8 +1006,12 @@ impl eframe::App for NmnlApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.config.columns = self.deck.specs();
         if let Err(e) = self.config.save() {
             eprintln!("設定の保存に失敗しました: {e}");
+        }
+        if let Some(stream) = &self.stream {
+            stream.shutdown();
         }
     }
 }

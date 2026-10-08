@@ -116,9 +116,16 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
-    /// イベント受信口。UI 層は update ループで `try_recv` する
+    /// イベント受信口(借用)。テストや直接ポーリング用
     pub fn event_rx(&mut self) -> &mut mpsc::UnboundedReceiver<StreamEvent> {
         &mut self.event_rx
+    }
+
+    /// イベント受信口の所有権を取り出す(一度だけ有効)。
+    /// app 層はこれを転送タスクに渡して UI イベントへ流す。2 度目以降は
+    /// 空の受信口が返る
+    pub fn take_event_rx(&mut self) -> mpsc::UnboundedReceiver<StreamEvent> {
+        std::mem::replace(&mut self.event_rx, mpsc::unbounded_channel().1)
     }
 
     pub fn subscribe(&self, channel: StreamChannel) -> oneshot::Receiver<String> {
