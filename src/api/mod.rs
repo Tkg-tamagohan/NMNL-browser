@@ -3,7 +3,9 @@
 //! 認証は Misskey 流儀どおりリクエストボディの `i` フィールドにトークンを載せる。
 
 use crate::config::{ColumnFilters, TimelineKind};
-use crate::model::{Channel, Emoji, EmojisResponse, InstanceMeta, Note, Notification, User};
+use crate::model::{
+    Channel, DriveFile, Emoji, EmojisResponse, InstanceMeta, Note, Notification, User,
+};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -159,7 +161,78 @@ impl ApiClient {
                 ),
             });
         }
-        let value: serde_json::Value = resp.json().await.map_err(ApiError::Network)?;
+        let value = parse_json_body(resp).await?;
+        serde_json::from_value(value).map_err(|e| ApiError::Unexpected(e.to_string()))
+    }
+
+    /// `POST /api/notes/create`: 投稿・返信・リノート・引用(F-06)。
+    /// リノートは renote_id のみ、引用は text + renote_id
+    pub async fn create_note(&self, req: &crate::model::CreateNote) -> Result<Note, ApiError> {
+        let resp: crate::model::CreatedNote = self.post("notes/create", req).await?;
+        Ok(resp.created_note)
+    }
+
+    /// `POST /api/notes/reactions/create`: リアクション付与(F-07-2)。
+    /// io は 204 No Content を返す
+    pub async fn create_reaction(&self, note_id: &str, reaction: &str) -> Result<(), ApiError> {
+        self.post(
+            "notes/reactions/create",
+            &serde_json::json!({ "noteId": note_id, "reaction": reaction }),
+        )
+        .await
+    }
+
+    /// `POST /api/notes/reactions/delete`: 自分のリアクション取り消し
+    pub async fn delete_reaction(&self, note_id: &str) -> Result<(), ApiError> {
+        self.post(
+            "notes/reactions/delete",
+            &serde_json::json!({ "noteId": note_id }),
+        )
+        .await
+    }
+
+    /// `POST /api/drive/files/create`: ドライブへ画像アップロード(F-06-2)。
+    /// multipart/form-data で、トークンはフォームの `i` フィールド
+    pub async fn upload_drive_file(
+        &self,
+        name: &str,
+        mime: &str,
+        data: Vec<u8>,
+    ) -> Result<DriveFile, ApiError> {
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(name.to_owned())
+            .mime_str(mime)
+            .map_err(|e| ApiError::Unexpected(e.to_string()))?;
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        if let Some(token) = &self.token {
+            form = form.text("i", token.clone());
+        }
+        let resp = self
+            .http
+            .post(self.api_url("drive/files/create"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(ApiError::Network)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.map_err(ApiError::Network)?;
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let err = &value["error"];
+                return Err(ApiError::Server {
+                    code: err["code"].as_str().unwrap_or("UNKNOWN").to_owned(),
+                    message: err["message"].as_str().unwrap_or("不明なエラー").to_owned(),
+                });
+            }
+            return Err(ApiError::Server {
+                code: format!("HTTP {}", status.as_u16()),
+                message: format!(
+                    "非 JSON 応答(先頭 120 文字): {}",
+                    text.chars().take(120).collect::<String>()
+                ),
+            });
+        }
+        let value = parse_json_body(resp).await?;
         serde_json::from_value(value).map_err(|e| ApiError::Unexpected(e.to_string()))
     }
 
@@ -442,6 +515,16 @@ fn user_show_body(query: &UserQuery) -> serde_json::Value {
             b
         }
     }
+}
+
+/// 成功応答のボディを JSON として読む。204 や空ボディは Null として返す
+/// (reactions/create 等のボディ無し応答対策)
+async fn parse_json_body(resp: reqwest::Response) -> Result<serde_json::Value, ApiError> {
+    let text = resp.text().await.map_err(ApiError::Network)?;
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|e| ApiError::Unexpected(e.to_string()))
 }
 
 /// `Option<String>` が Some のときだけ JSON オブジェクトにキーを挿入する。
@@ -998,5 +1081,166 @@ mod tests {
             ApiError::Server { code, .. } => assert_eq!(code, "HTTP 520"),
             _ => panic!("Server エラーのはず: {err:?}"),
         }
+    }
+
+    // POST-01: notes/create のリクエストボディ(F-06-1/-3)。
+    /// visibility・replyId・renoteId・fileIds・channelId・visibleUserIds の対応と
+    /// 未指定フィールドの省略を検証
+    #[test]
+    fn post01_create_note_body() {
+        use crate::model::{CreateNote, Visibility};
+        let req = CreateNote {
+            text: Some("本文".to_owned()),
+            cw: Some("注意".to_owned()),
+            visibility: Visibility::Specified,
+            visible_user_ids: vec!["u1".to_owned()],
+            file_ids: vec!["f1".to_owned(), "f2".to_owned()],
+            reply_id: Some("n9".to_owned()),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["text"], "本文");
+        assert_eq!(body["cw"], "注意");
+        assert_eq!(body["visibility"], "specified");
+        assert_eq!(body["visibleUserIds"], serde_json::json!(["u1"]));
+        assert_eq!(body["fileIds"], serde_json::json!(["f1", "f2"]));
+        assert_eq!(body["replyId"], "n9");
+        // 未指定の renoteId/channelId/local_only は JSON に出ない
+        assert!(body.get("renoteId").is_none());
+        assert!(body.get("channelId").is_none());
+        assert!(body.get("localOnly").is_none());
+        // リノート: renoteId のみ送れる形になる
+        let rn = serde_json::to_value(CreateNote {
+            renote_id: Some("t1".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rn["renoteId"], "t1");
+        assert!(rn.get("text").is_none());
+        assert!(rn.get("replyId").is_none());
+    }
+
+    // POST-02: notes/create の応答デコード(createdNote ラッパー経由)と
+    // トークン注入の実経路
+    #[tokio::test]
+    async fn post02_create_note_response() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/notes/create")
+                    .json_body_includes(
+                        "{\"text\":\"てすと\",\"visibility\":\"specified\",\"i\":\"tok-2\"}",
+                    );
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "createdNote": {
+                            "id": "n_new", "createdAt": "2026-10-08T00:00:00.000Z",
+                            "text": "てすと", "userId": "u1",
+                            "user": {"id":"u1","username":"me","host":null,"name":null,"avatarUrl":null},
+                            "visibility": "specified"
+                        }
+                    }));
+            })
+            .await;
+        let client = ApiClient::for_test(
+            format!("{}/api", server.base_url()),
+            Some("tok-2".to_owned()),
+        );
+        let note = client
+            .create_note(&crate::model::CreateNote {
+                text: Some("てすと".to_owned()),
+                visibility: crate::model::Visibility::Specified,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(note.id, "n_new");
+        assert_eq!(note.visibility, crate::model::Visibility::Specified);
+        m.assert_async().await;
+    }
+
+    // REA-02: reactions/create は 204(空ボディ)を受理する。
+    /// 旧実装は空ボディの JSON 解析で失敗したので回帰として残す
+    #[tokio::test]
+    async fn rea02_create_reaction_accepts_204() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/notes/reactions/create")
+                    .json_body(serde_json::json!({
+                        "noteId": "n1", "reaction": ":blobcat:", "i": "tok-3"
+                    }));
+                then.status(204);
+            })
+            .await;
+        let client = ApiClient::for_test(
+            format!("{}/api", server.base_url()),
+            Some("tok-3".to_owned()),
+        );
+        client
+            .create_reaction("n1", ":blobcat:")
+            .await
+            .expect("204 を受理するはず");
+        m.assert_async().await;
+    }
+
+    // REA-03: reactions/delete のリクエストと 204 受理
+    #[tokio::test]
+    async fn rea03_delete_reaction() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/notes/reactions/delete")
+                    .json_body(serde_json::json!({"noteId": "n1", "i": "tok-4"}));
+                then.status(204);
+            })
+            .await;
+        let client = ApiClient::for_test(
+            format!("{}/api", server.base_url()),
+            Some("tok-4".to_owned()),
+        );
+        client.delete_reaction("n1").await.expect("204 のはず");
+        m.assert_async().await;
+    }
+
+    // DRV-01: drive/files/create は multipart で `i` と `file` を送り、
+    /// 応答の DriveFile をデコードする
+    #[tokio::test]
+    async fn drv01_upload_multipart() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/drive/files/create")
+                    .body_includes("tok-5")
+                    .body_includes("filename=\"a.png\"")
+                    .body_includes("PNGDATA");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "d1", "name": "a.png", "type": "image/png",
+                        "url": "https://drive/d1.png"
+                    }));
+            })
+            .await;
+        let client = ApiClient::for_test(
+            format!("{}/api", server.base_url()),
+            Some("tok-5".to_owned()),
+        );
+        let file = client
+            .upload_drive_file("a.png", "image/png", b"PNGDATA".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(file.id, "d1");
+        assert_eq!(file.file_type, "image/png");
+        m.assert_async().await;
     }
 }

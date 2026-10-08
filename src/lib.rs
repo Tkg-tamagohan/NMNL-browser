@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod app;
+pub mod composer;
 pub mod config;
 pub mod deck;
 pub mod emoji;

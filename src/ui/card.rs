@@ -315,12 +315,51 @@ fn body(
         {
             ctx.ops.push(UiOp::OpenUrl(u));
         }
-        ui.label(
-            RichText::new("↩ 🔁 ❝ 😀 ⋯")
-                .size(11.0)
-                .color(Color32::DARK_GRAY),
-        )
-        .on_hover_text("投稿系の操作は Phase 7 で実装予定");
+        // 投稿系操作(F-06/E・仕様決定 E)。↩/❝ はフォームに対象をセット、
+        // 🔁 は即時リノート、😀 はリアクションピッカー
+        let label = format!(
+            "@{}{}",
+            note.user.username,
+            note.user
+                .host
+                .as_deref()
+                .map(|h| format!("@{h}"))
+                .unwrap_or_default()
+        );
+        if ui
+            .button(RichText::new("↩").size(12.0))
+            .on_hover_text("返信")
+            .clicked()
+        {
+            ctx.ops.push(UiOp::ReplyTo {
+                id: note.id.clone(),
+                label: label.clone(),
+            });
+        }
+        if ui
+            .button(RichText::new("🔁").size(12.0))
+            .on_hover_text("リノート")
+            .clicked()
+        {
+            ctx.ops.push(UiOp::Renote(note.id.clone()));
+        }
+        if ui
+            .button(RichText::new("❝").size(12.0))
+            .on_hover_text("引用")
+            .clicked()
+        {
+            ctx.ops.push(UiOp::Quote {
+                id: note.id.clone(),
+                label,
+            });
+        }
+        if ui
+            .button(RichText::new("😀").size(12.0))
+            .on_hover_text("リアクション")
+            .clicked()
+        {
+            ctx.ops.push(UiOp::OpenReactionPicker(note.id.clone()));
+        }
     });
 }
 
@@ -463,7 +502,9 @@ fn reaction_badge(ui: &mut Ui, name: &str, count: u32, note: &Note, ctx: &mut Ui
     let count_text = RichText::new(count.to_string())
         .size(11.0)
         .color(Color32::LIGHT_GRAY);
-    if let Some(emoji_name) = name.strip_prefix(':').and_then(|s| s.strip_suffix(':')) {
+    // バッジクリックでトグル(F-07): 自分のは取り消し、それ以外は付与
+    let clicked = if let Some(emoji_name) = name.strip_prefix(':').and_then(|s| s.strip_suffix(':'))
+    {
         // :name: 形式はカスタム絵文字。reaction_emojis → note.emojis → キャッシュの順
         let url = note
             .reaction_emojis
@@ -472,30 +513,38 @@ fn reaction_badge(ui: &mut Ui, name: &str, count: u32, note: &Note, ctx: &mut Ui
             .cloned()
             .or_else(|| ctx.emoji_cache.resolve(emoji_name));
         match url {
-            Some(u) => {
-                ui.add(
+            Some(u) => ui
+                .add(
                     egui::Button::image_and_text(
                         egui::Image::new(u).fit_to_exact_size(vec2(14.0, 14.0)),
                         count_text,
                     )
                     .fill(bg)
                     .stroke(stroke),
-                );
-            }
-            None => {
-                ui.add(
+                )
+                .clicked(),
+            None => ui
+                .add(
                     egui::Button::new(RichText::new(format!(":{emoji_name}: {count}")).size(11.0))
                         .fill(bg)
                         .stroke(stroke),
-                );
-            }
+                )
+                .clicked(),
         }
     } else {
         ui.add(
             egui::Button::new(RichText::new(format!("{name} {count}")).size(11.0))
                 .fill(bg)
                 .stroke(stroke),
-        );
+        )
+        .clicked()
+    };
+    if clicked {
+        ctx.ops.push(UiOp::ToggleReaction {
+            note_id: note.id.clone(),
+            reaction: name.to_owned(),
+            mine,
+        });
     }
 }
 
