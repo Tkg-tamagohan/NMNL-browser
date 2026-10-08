@@ -124,14 +124,15 @@ impl Composer {
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_owned();
-        // 同一ファイルの重複添付は io 側で INVALID_PARAM になる実測が
-        // あるため、同名+同サイズの二重追加は弾く
+        // 同一内容の重複添付は io 側で INVALID_PARAM になる実測が
+        // あるため、バイト列が一致する二重追加は弾く。同名+同サイズでは
+        // 別ファイルを誤爆するので内容で比較する
         if self
             .files
             .iter()
-            .any(|f| f.name == name && f.data.len() == data.len())
+            .any(|f| f.data.as_slice() == data.as_slice())
         {
-            self.error = Some(format!("同じファイルは重複添付できません: {name}"));
+            self.error = Some(format!("同じ内容のファイルは重複添付できません: {name}"));
             return;
         }
         self.files.push(PendingFile {
@@ -221,7 +222,7 @@ mod tests {
     fn post04_attachment_rules() {
         let mut c = Composer::default();
         for i in 0..MAX_ATTACHMENTS + 2 {
-            c.push_dropped(Path::new(&format!("/tmp/p{i}.png")), vec![0u8]);
+            c.push_dropped(Path::new(&format!("/tmp/p{i}.png")), vec![i as u8]);
         }
         assert_eq!(c.files.len(), MAX_ATTACHMENTS);
         assert!(c.error.is_some());
@@ -232,17 +233,19 @@ mod tests {
         assert!(c2.files.is_empty());
         assert!(c2.error.is_some());
         // webp/gif/jpeg は受け付ける
-        for n in ["b.webp", "c.gif", "d.jpg", "e.jpeg"] {
-            c2.push_dropped(Path::new(&format!("/tmp/{n}")), vec![0u8]);
+        for (i, n) in ["b.webp", "c.gif", "d.jpg", "e.jpeg"].iter().enumerate() {
+            c2.push_dropped(Path::new(&format!("/tmp/{n}")), vec![i as u8]);
         }
         assert_eq!(c2.files.len(), 4);
 
-        // 同一ファイル(同名+同サイズ)の二重添付は弾く
-        // (io が INVALID_PARAM を返す実測があった)
+        // 同一内容の二重添付は弾く(io が INVALID_PARAM を返す実測)
         let mut c3 = Composer::default();
         c3.push_dropped(Path::new("/tmp/same.png"), vec![7u8; 4]);
         c3.push_dropped(Path::new("/tmp/same.png"), vec![7u8; 4]);
         assert_eq!(c3.files.len(), 1);
         assert!(c3.error.is_some());
+        // 同名+同サイズでも中身が違えば別ファイルとして受け付ける
+        c3.push_dropped(Path::new("/tmp/same.png"), vec![8u8; 4]);
+        assert_eq!(c3.files.len(), 2);
     }
 }
