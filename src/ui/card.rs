@@ -56,6 +56,15 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
         .stroke(Stroke::new(1.0f32, Color32::from_rgb(0x32, 0x34, 0x3c)))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(8, 6));
+    // 会話ビューの起点 ID をカード単位で一度だけ決める。
+    // 純粋リノートは表示対象(直近のリノート元)に揃え、カード内部
+    // クリックと 💬 ボタンで同じ会話を開く(入れ子リノートでの競合防止)
+    let conv_id = if note.is_pure_renote() {
+        note.renote.as_ref().map(|r| r.id.clone())
+    } else {
+        None
+    }
+    .unwrap_or_else(|| note.id.clone());
     let inner = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
         if note.is_pure_renote()
@@ -67,21 +76,14 @@ pub fn note_card(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64) {
                     .color(Color32::from_rgb(0x9e, 0xd0, 0x8e))
                     .size(11.0),
             );
-            body(ui, target, ctx, col_id, true);
+            body(ui, target, ctx, col_id, true, &conv_id);
         } else {
-            body(ui, note, ctx, col_id, false);
+            body(ui, note, ctx, col_id, false, &conv_id);
         }
     });
     // カード本体クリックで会話ビュー(F-05-5)。widget の interact では
     // 子ボタンやラベルの hover-sense widget が遮る/遮られるため、
-    // リリース位置と除外ゾーン(クリック可能な子の矩形)で判定する。
-    // 純粋リノートは表示対象(リノート元)と同じ会話を開く
-    let conv_id = if note.is_pure_renote() {
-        note.renote.as_ref().map(|r| r.id.clone())
-    } else {
-        None
-    }
-    .unwrap_or_else(|| note.id.clone());
+    // リリース位置と除外ゾーン(クリック可能な子の矩形)で判定する
     let card_rect = inner.response.rect;
     // クリック = カード内で押下を開始し、カード内でリリース。
     // primary_clicked は egui のクリック閾値(max_click_dist)考慮済みで
@@ -133,7 +135,14 @@ fn display_name(user: &crate::model::User) -> String {
 /// ノート本体(ヘッダ+CW+本文+メディア+ネスト参照+リアクション+操作行)。
 /// `bannered` はリノート表示の中身側で「自分の user 行を target のものに差し替える」
 /// ため既に本体がリノート元であることを示すフラグではなく、常に target を渡す設計にした
-fn body(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64, _bannered: bool) {
+fn body(
+    ui: &mut Ui,
+    note: &Note,
+    ctx: &mut UiCtx<'_>,
+    col_id: u64,
+    _bannered: bool,
+    conv_id: &str,
+) {
     // ヘッダ: アバター + 名前 + @id@host + 時刻
     ui.horizontal(|ui| {
         let avatar_size = vec2(28.0, 28.0);
@@ -295,17 +304,8 @@ fn body(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64, _bannered: b
             .on_hover_text("会話を表示")
             .clicked()
         {
-            // 純粋リノートでは会話ビューの起点を内側のノートに揃える
-            // (カード内部クリックと同じ)
-            let conv_id = if note.is_pure_renote() {
-                note.renote
-                    .as_ref()
-                    .map(|r| r.id.clone())
-                    .unwrap_or_else(|| note.id.clone())
-            } else {
-                note.id.clone()
-            };
-            ctx.ops.push(UiOp::OpenConversation(col_id, conv_id));
+            ctx.ops
+                .push(UiOp::OpenConversation(col_id, conv_id.to_owned()));
         }
         if let Some(u) = url
             && ui
