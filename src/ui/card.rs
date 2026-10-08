@@ -295,8 +295,17 @@ fn body(ui: &mut Ui, note: &Note, ctx: &mut UiCtx<'_>, col_id: u64, _bannered: b
             .on_hover_text("会話を表示")
             .clicked()
         {
-            ctx.ops
-                .push(UiOp::OpenConversation(col_id, note.id.clone()));
+            // 純粋リノートでは会話ビューの起点を内側のノートに揃える
+            // (カード内部クリックと同じ)
+            let conv_id = if note.is_pure_renote() {
+                note.renote
+                    .as_ref()
+                    .map(|r| r.id.clone())
+                    .unwrap_or_else(|| note.id.clone())
+            } else {
+                note.id.clone()
+            };
+            ctx.ops.push(UiOp::OpenConversation(col_id, conv_id));
         }
         if let Some(u) = url
             && ui
