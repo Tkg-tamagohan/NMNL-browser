@@ -480,15 +480,22 @@ impl Column {
     /// (捨てた側は保留先頭より新しい区間なので、その ID から補充する)
     pub fn set_paused(&mut self, paused: bool) {
         if self.paused && !paused {
-            // 溢れで捨てた区間の下端(=残した最古 ID)はドレイン前に採る
-            let oldest_kept = if self.pending_overflow {
-                self.pending_notes
+            // 溢れで捨てた区間の境界(=残した最古・最新 ID)はドレイン前に採る。
+            // 生応答のカーソルで newest_id は進むので、捨てた分を含まない
+            // 実バッファ基準の値を使わないと区間を飛び越す
+            let (oldest_kept, newest_kept) = if self.pending_overflow {
+                let ids: Vec<&String> = self
+                    .pending_notes
                     .iter()
-                    .map(|n| n.id.clone())
-                    .chain(self.pending_notifs.iter().map(|n| n.id.clone()))
-                    .min()
+                    .map(|n| &n.id)
+                    .chain(self.pending_notifs.iter().map(|n| &n.id))
+                    .collect();
+                (
+                    ids.iter().min().map(|s| (*s).clone()),
+                    ids.iter().max().map(|s| (*s).clone()),
+                )
             } else {
-                None
+                (None, None)
             };
             while let Some(n) = self.pending_notes.pop_front() {
                 self.insert_note_sorted(n);
@@ -505,11 +512,10 @@ impl Column {
                     // 補充の途中で溢れた: 歩き切れていない区間を
                     // until→since で解除後に取り切る
                     self.backfill_until = oldest_kept;
-                    // 補充と同時に届いた新着分が溢れた場合、残した最新側
-                    // より新しい区間も欠落しているので別区間として控える
-                    if let Some(newest) = self.newest_id.clone() {
-                        self.extra_backfill = Some((Some(newest), None));
-                    }
+                    // 補充と同時に届いた分が溢れた場合、残した最新側より
+                    // 新しい区間も欠落しているので別区間として控える。
+                    // 起点は実バッファの最新 ID(生カーソルは捨てた分を含む)
+                    self.extra_backfill = Some((newest_kept, None));
                 } else {
                     // ストリーミング分だけの溢れ: 捨てた分は合成結果の
                     // 最前端より新しい区間なので、その ID を起点に補充する
@@ -1178,6 +1184,37 @@ mod tests {
         // 新しい側: 残した最新から先(落ちた n0700 を拾う区間)
         assert_eq!(col.extra_backfill, Some((Some("n0600".to_owned()), None)));
         // 落ちた新着は seen に残っていないので拾い直せる
+        assert!(col.push_note(note("n0700")));
+    }
+
+    /// COL-20: ストリーミングが先にバッファを埋めてから補充が来た場合、
+    /// 捨てた補充分を挟んで新しい側の区間も拾う(生カーソルではなく
+    /// 実バッファの最新 ID を起点にする)
+    #[test]
+    fn col20_streaming_fills_buffer_before_backfill() {
+        let mut col = tl_column();
+        col.backfill_since = Some("n0000".to_owned());
+        col.set_paused(true);
+        // ストリーミング分でバッファを埋める(n0001..n0500)
+        for i in 1..=PENDING_CAP {
+            col.push_note(note(&format!("n{i:04}")));
+        }
+        // 遅れて届いた補充(n1100..n0001)は全部溢れで捨てられるが、
+        // 生カーソルで newest_id は n1100 まで進む
+        let notes: Vec<Note> = (1..=1100)
+            .rev()
+            .map(|i| note(&format!("n{i:04}")))
+            .collect();
+        col.append_backfill(notes, Some("n0001".to_owned()), Some("n1100".to_owned()));
+        assert_eq!(col.newest_id.as_deref(), Some("n1100"));
+        col.set_paused(false);
+        // 古い側: 残した最古から切断境界まで
+        assert_eq!(col.backfill_until.as_deref(), Some("n0001"));
+        assert_eq!(col.backfill_since.as_deref(), Some("n0000"));
+        // 新しい側は「残した最新 n0500」起点 — 生カーソル n1100 を
+        // 起点にすると捨てた n0501..n1100 を永遠に飛び越す
+        assert_eq!(col.extra_backfill, Some((Some("n0500".to_owned()), None)));
+        // 捨てた補充分は seen に残っていないので拾い直せる
         assert!(col.push_note(note("n0700")));
     }
 }
