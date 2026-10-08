@@ -1,7 +1,9 @@
 name: release
 
 # タグ push (v*) でリリースを作る。Windows/Linux のバイナリに LICENSE と
-# ドキュメントを同梱して GitHub Releases に置く(Phase 9)
+# ドキュメントを同梱して GitHub Releases に置く(Phase 9)。
+# 両 OS のビルドが揃ってから release ジョブが一括で公開する(片方だけ
+# 成功した不完全なリリースが残らないようにする)
 on:
   push:
     tags: ["v*"]
@@ -52,13 +54,27 @@ jobs:
           cp LICENSE README.md dist/nmnl-browser/
           cp -r docs dist/nmnl-browser/
           (cd dist && 7z a "../${{ matrix.asset_name }}" nmnl-browser)
-      # どちらの OS ジョブが先でも作れるよう、両方で作成を試みてから添付する
-      - name: Create GitHub Release
-        continue-on-error: true
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    # 両プラットフォームのビルドが成功してからだけ公開する
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nmnl-browser-*
+          merge-multiple: true
+      - name: Create GitHub Release with assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes
-      - name: Upload to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "${{ matrix.asset_name }}" --clobber
+        run: |
+          ls -la
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" --generate-notes \
+            nmnl-browser-*.tar.gz nmnl-browser-*.zip
