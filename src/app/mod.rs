@@ -643,6 +643,7 @@ impl NmnlApp {
                 self.sync_subscriptions(ctx);
             }
             UiOp::MoveTo(id, to) => self.deck.move_to(id, to),
+            UiOp::MoveDelta(id, d) => self.deck.move_delta(id, d),
             UiOp::SetWidth(id, w) => self.deck.set_width(id, w),
             UiOp::SetPaused(id, p) => {
                 self.deck.set_paused(id, p);

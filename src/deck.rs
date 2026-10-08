@@ -694,6 +694,20 @@ impl ColumnDeck {
         }
     }
 
+    /// 相対移動(F-02-4 の ≡ ドラッグ代替経路)。-1 で左、+1 で右。
+    /// 端での移動は無操作
+    pub fn move_delta(&mut self, id: u64, delta: i32) {
+        let Some(from) = self.columns.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let to = from as i64 + delta as i64;
+        if to < 0 || to >= self.columns.len() as i64 {
+            return;
+        }
+        self.columns.swap(from, to as usize);
+        self.columns[to as usize].dirty = true;
+    }
+
     pub fn set_width(&mut self, id: u64, width: f32) {
         if let Some(col) = self.columns.iter_mut().find(|c| c.id == id) {
             col.spec.width = width.clamp(COL_WIDTH_MIN, COL_WIDTH_MAX);
@@ -1216,5 +1230,46 @@ mod tests {
         assert_eq!(col.extra_backfill, Some((Some("n0500".to_owned()), None)));
         // 捨てた補充分は seen に残っていないので拾い直せる
         assert!(col.push_note(note("n0700")));
+    }
+
+    /// COL-21: 設定パネルの ←→ 相対移動(move_delta)が列を交換し、端では無操作
+    #[test]
+    fn col21_move_delta_swaps_and_clamps() {
+        let mut deck = ColumnDeck::from_specs(vec![
+            ColumnSpec {
+                kind: ColumnKind::Timeline,
+                ..Default::default()
+            },
+            ColumnSpec {
+                kind: ColumnKind::Mentions,
+                ..Default::default()
+            },
+            ColumnSpec {
+                kind: ColumnKind::Notifications,
+                ..Default::default()
+            },
+        ]);
+        deck.take_dirty();
+        let ids: Vec<u64> = deck.columns.iter().map(|c| c.id).collect();
+        let kind_at = |d: &ColumnDeck, i: usize| d.columns[i].spec.kind.clone();
+
+        // 中央を右へ → 1 つ右と交換
+        deck.move_delta(ids[1], 1);
+        assert_eq!(kind_at(&deck, 2), ColumnKind::Mentions);
+        assert_eq!(kind_at(&deck, 1), ColumnKind::Notifications);
+        assert!(deck.take_dirty());
+
+        // 右端を右へ → 無操作
+        deck.move_delta(ids[1], 1);
+        assert_eq!(kind_at(&deck, 2), ColumnKind::Mentions);
+
+        // 左端を左へ → 無操作
+        deck.move_delta(ids[0], -1);
+        assert_eq!(kind_at(&deck, 0), ColumnKind::Timeline);
+
+        // 左端を右へ
+        deck.move_delta(ids[0], 1);
+        assert_eq!(kind_at(&deck, 1), ColumnKind::Timeline);
+        assert_eq!(kind_at(&deck, 0), ColumnKind::Notifications);
     }
 }

@@ -21,6 +21,8 @@ pub enum UiOp {
     AddColumn(AddableKind),
     Remove(u64),
     MoveTo(u64, usize),
+    /// 相対移動(-1=左へ、+1=右へ)。≡ ドラッグと併用する別経路(F-02-4)
+    MoveDelta(u64, i32),
     SetWidth(u64, f32),
     SetPaused(u64, bool),
     SetTimelineKind(u64, crate::config::TimelineKind),
@@ -212,6 +214,16 @@ fn header(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
 /// 設定パネル: 幅、TL 種別、フィルタ、通知種別、チャンネル選択(F-02-1/F-03/F-04-1)
 fn settings_panel(ui: &mut Ui, col: &mut Column, ctx: &mut UiCtx<'_>) {
     let id = col.id;
+    // 順番移動(≡ ドラッグの代替経路。F-02-4)
+    ui.horizontal(|ui| {
+        ui.label("順番:");
+        if ui.button("←").on_hover_text("左へ移動").clicked() {
+            ctx.ops.push(UiOp::MoveDelta(id, -1));
+        }
+        if ui.button("→").on_hover_text("右へ移動").clicked() {
+            ctx.ops.push(UiOp::MoveDelta(id, 1));
+        }
+    });
     ui.horizontal(|ui| {
         ui.label("幅:");
         let mut w = col.spec.width;
